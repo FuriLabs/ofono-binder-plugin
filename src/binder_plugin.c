@@ -1528,6 +1528,31 @@ binder_plugin_parse_radio_interface(
     return BINDER_DEFAULT_RADIO_INTERFACE;
 }
 
+static
+RADIO_INTERFACE
+binder_plugin_detect_radio_interface(
+    GBinderServiceManager *sm,
+    const char* slot_name)
+{
+    g_autofree gchar* servicename = NULL;
+
+    for (int i = G_N_ELEMENTS(binder_radio_ifaces)-1; i >= 0; i--) {
+        char* servicename = g_strconcat(binder_radio_ifaces[i], "/", slot_name, NULL);
+
+        GBinderRemoteObject* obj =
+            gbinder_servicemanager_get_service_sync(sm, servicename, NULL);
+
+        g_free(servicename);
+
+        if (obj) {
+            /* Found */
+            return i;
+        }
+    }
+
+    return BINDER_DEFAULT_RADIO_INTERFACE;
+}
+
 /*
  * Parse the spec according to the following grammar:
  *
@@ -1645,7 +1670,6 @@ binder_plugin_create_slot(
 
     slot->name = g_strdup(name);
     slot->svcmgr = gbinder_servicemanager_ref(sm);
-    slot->version = BINDER_DEFAULT_RADIO_INTERFACE;
     slot->req_timeout_ms = BINDER_DEFAULT_SLOT_REQ_TIMEOUT_MS;
     slot->slot_flags = BINDER_DEFAULT_SLOT_FLAGS;
     slot->start_timeout_ms = BINDER_DEFAULT_SLOT_START_TIMEOUT_MS;
@@ -1699,6 +1723,8 @@ binder_plugin_create_slot(
         DBG("%s: " BINDER_CONF_SLOT_RADIO_INTERFACE " %s", group, sval);
         slot->version = binder_plugin_parse_radio_interface(sval);
         g_free(sval);
+    } else {
+        slot->version = binder_plugin_detect_radio_interface(slot->svcmgr, slot->name);
     }
 
     /* startTimeout */
