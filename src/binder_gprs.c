@@ -199,8 +199,8 @@ binder_gprs_max_data_calls_changed(
     BinderGprs* self = user_data;
 
     if (net->max_data_calls > 0) {
-        DBG_(self, "setting max cids to %d", net->max_data_calls);
-        ofono_gprs_set_cid_range(self->gprs, 1, net->max_data_calls);
+        DBG_(self, "setting max cids to %d", net->max_data_calls + 3);
+        ofono_gprs_set_cid_range(self->gprs, 1, net->max_data_calls + 3);
     }
 }
 
@@ -256,8 +256,8 @@ binder_gprs_register(
         network->data.status);
 
     if (network->max_data_calls > 0) {
-        DBG_(self, "setting max cids to %d", network->max_data_calls);
-        ofono_gprs_set_cid_range(gprs, 1,network->max_data_calls);
+        DBG_(self, "setting max cids to %d", network->max_data_calls + 3);
+        ofono_gprs_set_cid_range(gprs, 1,network->max_data_calls + 3);
     }
 
     ofono_gprs_register(gprs);
