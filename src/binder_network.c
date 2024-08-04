@@ -1485,7 +1485,7 @@ binder_network_can_set_pref_mode(
      * With some modems an attempt to set rat significantly slows
      * down SIM I/O, let's avoid that.
      */
-    return self->radio->online && binder_sim_card_ready(self->simcard) &&
+    return FALSE && self->radio->online && binder_sim_card_ready(self->simcard) &&
         !self->simcard->sim_io_active && !self->timer[TIMER_SET_RAT_HOLDOFF];
 }
 
@@ -1534,7 +1534,7 @@ binder_network_set_pref(
 {
     BinderSimCard* card = self->simcard;
 
-    if (!self->set_rat_req &&
+    if (FALSE && !self->set_rat_req &&
         self->radio->online &&
         binder_sim_card_ready(card) &&
         /*

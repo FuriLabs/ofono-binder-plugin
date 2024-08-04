@@ -90,7 +90,7 @@ binder_call_forwarding_call(
      * getCallForwardStatus(int32_t serial, CallForwardInfo callInfo);
      * setCallForward(int32_t serial, CallForwardInfo callInfo);
      */
-    GBinderWriter writer;
+/*    GBinderWriter writer;
     RadioRequest* req = radio_request_new2(self->g, code, &writer, complete,
         binder_call_forwarding_callback_data_free,
         binder_call_forwarding_callback_data_new(cb, data));
@@ -113,7 +113,7 @@ binder_call_forwarding_call(
     binder_append_hidl_string_data(&writer, info, number, parent);
 
     radio_request_submit(req);
-    radio_request_unref(req);
+    radio_request_unref(req);*/
 }
 
 static

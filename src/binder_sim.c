@@ -2384,10 +2384,10 @@ binder_sim_session_read_info(
     ofono_sim_file_info_cb_t cb,
     void* data)
 {
-    struct ofono_error error;
+    /* struct ofono_error error;
 
     ofono_error("session_read_info not implemented");
-    cb(binder_error_failure(&error), -1, -1, -1, NULL, 0, data);
+    cb(binder_error_failure(&error), -1, -1, -1, NULL, 0, data); */
 }
 
 static
