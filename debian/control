@@ -10,6 +10,7 @@ Build-Depends: debhelper,
                libglibutil-dev (>= 1.0.61),
                libmce-glib-dev (>= 1.0.6),
                ofono-dev (>= 1.29),
+               libupower-glib-dev,
 Standards-Version: 3.8.4
 
 Package: ofono-binder-plugin
