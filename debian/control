@@ -11,6 +11,8 @@ Build-Depends: debhelper,
                libmce-glib-dev (>= 1.0.6),
                ofono-dev (>= 1.29),
                libupower-glib-dev,
+               batman-dev,
+               libbatman-wrappers,
 Standards-Version: 3.8.4
 
 Package: ofono-binder-plugin
@@ -19,6 +21,7 @@ Multi-Arch: same
 Depends: ${shlibs:Depends},
          ${misc:Depends},
          libofonobinderpluginext (= ${binary:Version}),
+         libbatman-wrappers,
 Description: Binder plugin for the Sailfish OS fork of ofono
 
 Package: ofono-configs-binder-example
