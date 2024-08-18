@@ -22,6 +22,8 @@
 #include <mce_charger.h>
 #include <mce_display.h>
 
+#include <upower.h>
+
 #include <radio_client.h>
 #include <radio_request.h>
 #include <radio_network_types.h>
@@ -29,6 +31,8 @@
 #include <gbinder_writer.h>
 
 #include <gutil_macros.h>
+
+#define BATMAN_SCREEN_PATH "/var/lib/batman/screen"
 
 enum binder_devmon_if_battery_event {
     BATTERY_EVENT_VALID,
@@ -55,6 +59,7 @@ typedef struct binder_devmon_if {
     MceDisplay* display;
     int cell_info_interval_short_ms;
     int cell_info_interval_long_ms;
+    UpClient* upower;
 } DevMon;
 
 typedef struct binder_devmon_if_io {
@@ -72,6 +77,7 @@ typedef struct binder_devmon_if_io {
     gulong display_event_id[DISPLAY_EVENT_COUNT];
     int cell_info_interval_short_ms;
     int cell_info_interval_long_ms;
+    UpClient* upower;
 } DevMonIo;
 
 #define DBG_(self,fmt,args...) \
@@ -91,6 +97,73 @@ static inline gboolean binder_devmon_if_charging(MceCharger* charger)
 
 static gboolean binder_devmon_if_display_on(MceDisplay* display)
     { return display->valid && display->state != MCE_DISPLAY_STATE_OFF; }
+
+typedef enum {
+    BATMAN_NO_BATTERY = 0,      /** No battery present in the system */
+    BATMAN_CHARGING = 1,        /** Battery is currently charging */
+    BATMAN_DISCHARGING = 2,     /** Battery is currently discharging */
+    BATMAN_FULLY_CHARGED = 3,   /** Battery is fully charged */
+    BATMAN_UNKNOWN = 4          /** Battery state cannot be determined */
+} batman_state_t;
+
+static batman_state_t
+get_battery_state(UpClient *upower)
+{
+    UpDevice *device = NULL;
+    batman_state_t state = BATMAN_NO_BATTERY;
+
+    device = up_device_new();
+
+    if (!up_device_set_object_path_sync(device,
+                                        "/org/freedesktop/UPower/devices/DisplayDevice",
+                                        NULL,
+                                        NULL)) {
+        g_debug("Failed to set device object path");
+        g_object_unref(device);
+        return BATMAN_NO_BATTERY;
+    }
+
+    if (device != NULL) {
+        UpDeviceState up_state;
+        gboolean power_supply;
+        UpDeviceKind kind;
+        gdouble percent; /* still required for g_object_get even if unused */
+
+        g_object_get(device,
+                     "power-supply", &power_supply,
+                     "kind", &kind,
+                     "state", &up_state,
+                     "percentage", &percent,
+                     NULL);
+
+        if (power_supply == TRUE && kind == UP_DEVICE_KIND_BATTERY) {
+            switch (up_state) {
+                case UP_DEVICE_STATE_CHARGING:
+                    state = BATMAN_CHARGING;
+                    break;
+
+                case UP_DEVICE_STATE_DISCHARGING:
+                    state = BATMAN_DISCHARGING;
+                    break;
+
+                case UP_DEVICE_STATE_FULLY_CHARGED:
+                    state = BATMAN_FULLY_CHARGED;
+                    break;
+
+                default:
+                    state = BATMAN_UNKNOWN;
+                    break;
+            }
+        }
+
+        g_object_unref(device);
+    }
+
+    if (state == BATMAN_NO_BATTERY)
+        g_debug("no battery");
+
+    return state;
+}
 
 static
 void
@@ -236,6 +309,53 @@ binder_devmon_if_io_display_cb(
 }
 
 static
+gboolean
+binder_devmon_if_io_batman_powersave(
+   gpointer user_data)
+{
+    DevMonIo* self = (DevMonIo*)user_data;
+
+    int display = 0;
+    int state = BATMAN_UNKNOWN;
+
+    /* would be nice to have a dbus system service that reports status of session instead of this */
+    FILE *screen_file = fopen(BATMAN_SCREEN_PATH, "r");
+    if (screen_file != NULL) {
+        char screen_state[4];
+        if (fgets(screen_state, sizeof(screen_state), screen_file) != NULL) {
+            if (strncmp(screen_state, "yes", 3) == 0)
+                display = 1;
+            DBG_(self, "screen state: %s", screen_state);
+        } else {
+            DBG_(self, "Failed to read screen state");
+        }
+        fclose(screen_file);
+    } else {
+        DBG_(self, "Failed to open screen state file: %s", strerror(errno));
+    }
+
+    state = get_battery_state(self->upower);
+    DBG_(self, "Battery state: %s",
+         state == BATMAN_NO_BATTERY ? "no battery" :
+         state == BATMAN_CHARGING ? "charging" :
+         state == BATMAN_DISCHARGING ? "discharging" :
+         state == BATMAN_FULLY_CHARGED ? "fully charged" : "unknown");
+
+    const gboolean charging = (state == 1 || state == 2);
+    gint cell_info_interval = (display || charging) ?
+                               self->cell_info_interval_short_ms :
+                               self->cell_info_interval_long_ms;
+
+    DBG_(self, "Setting cell info interval: %d (display:%d charging:%d)",
+         cell_info_interval, display, charging);
+
+    ofono_slot_set_cell_info_update_interval(self->slot, self, cell_info_interval);
+
+    return G_SOURCE_CONTINUE;
+}
+
+
+static
 void
 binder_devmon_if_io_free(
     BinderDevmonIo* io)
@@ -303,8 +423,13 @@ binder_devmon_if_start_io(
     self->cell_info_interval_short_ms = impl->cell_info_interval_short_ms;
     self->cell_info_interval_long_ms = impl->cell_info_interval_long_ms;
 
+    self->upower = impl->upower;
+
     binder_devmon_if_io_set_indication_filter(self);
     binder_devmon_if_io_set_cell_info_update_interval(self);
+
+    g_timeout_add_seconds(5, binder_devmon_if_io_batman_powersave, self);
+
     return &self->pub;
 }
 
@@ -318,6 +443,7 @@ binder_devmon_if_free(
     mce_battery_unref(self->battery);
     mce_charger_unref(self->charger);
     mce_display_unref(self->display);
+    g_object_unref(self->upower);
     g_free(self);
 }
 
@@ -336,6 +462,7 @@ binder_devmon_if_new(
     self->battery = mce_battery_new();
     self->charger = mce_charger_new();
     self->display = mce_display_new();
+    self->upower = up_client_new();
     self->cell_info_interval_short_ms = config->cell_info_interval_short_ms;
     self->cell_info_interval_long_ms = config->cell_info_interval_long_ms;
     return &self->pub;

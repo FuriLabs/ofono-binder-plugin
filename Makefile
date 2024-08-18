@@ -12,7 +12,7 @@
 # on all platforms.
 #
 
-LDPKGS = libgbinder-radio libgbinder libmce-glib libglibutil gobject-2.0 glib-2.0
+LDPKGS = libgbinder-radio libgbinder libmce-glib libglibutil gobject-2.0 glib-2.0 upower-glib
 PKGS = ofono $(LDPKGS)
 
 #
