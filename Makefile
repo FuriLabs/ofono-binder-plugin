@@ -12,7 +12,7 @@
 # on all platforms.
 #
 
-LDPKGS = libgbinder-radio libgbinder libmce-glib libglibutil gobject-2.0 glib-2.0
+LDPKGS = libgbinder-radio libgbinder libmce-glib libglibutil gobject-2.0 glib-2.0 upower-glib
 PKGS = ofono $(LDPKGS)
 
 #
@@ -95,7 +95,7 @@ BASE_FLAGS = -fPIC -fvisibility=hidden
 FULL_CFLAGS = $(BASE_FLAGS) $(CFLAGS) $(DEFINES) $(WARNINGS) -MMD -MP \
   $(shell pkg-config --cflags $(PKGS)) -I$(EXTLIB_DIR)/include
 FULL_LDFLAGS = $(BASE_FLAGS) $(LDFLAGS) -shared \
-  $(shell pkg-config --libs $(LDPKGS))
+  $(shell pkg-config --libs $(LDPKGS)) -lbatman-wrappers
 DEBUG_FLAGS = -g
 RELEASE_FLAGS =
 COVERAGE_FLAGS = -g

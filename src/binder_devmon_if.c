@@ -29,6 +29,8 @@
 
 #include <gutil_macros.h>
 
+#include <batman/batman-wrappers.h>
+
 enum binder_devmon_if_battery_event {
     BATTERY_EVENT_VALID,
     BATTERY_EVENT_STATUS,
@@ -54,6 +56,7 @@ typedef struct binder_devmon_if {
     MceDisplay* display;
     int cell_info_interval_short_ms;
     int cell_info_interval_long_ms;
+    UpClient* upower;
 } DevMon;
 
 typedef struct binder_devmon_if_io {
@@ -71,6 +74,7 @@ typedef struct binder_devmon_if_io {
     gulong display_event_id[DISPLAY_EVENT_COUNT];
     int cell_info_interval_short_ms;
     int cell_info_interval_long_ms;
+    UpClient* upower;
 } DevMonIo;
 
 #define DBG_(self,fmt,args...) \
@@ -213,6 +217,48 @@ binder_devmon_if_io_display_cb(
 }
 
 static
+gboolean
+binder_devmon_if_io_batman_powersave(
+   gpointer user_data)
+{
+    DevMonIo* self = (DevMonIo*)user_data;
+    const gchar *state;
+    int display = 0;
+    int battery_state = -1;
+
+    /* would be nice to have a dbus system service that reports status of session instead of this */
+    FILE *screen_file = fopen("/var/lib/batman/screen", "r");
+    if (screen_file != NULL) {
+        char screen_state[4];
+        if (fgets(screen_state, sizeof(screen_state), screen_file) != NULL) {
+            if (strncmp(screen_state, "yes", 3) == 0)
+                display = 1;
+        }
+        fclose(screen_file);
+    }
+
+    state = findBattery(self->upower, NULL);
+    if (state != NULL) {
+        if (strcmp(state, "discharging") == 0)
+            battery_state = 0;
+        else if (strcmp(state, "charging") == 0)
+            battery_state = 1;
+        else if (strcmp(state, "fully-charged") == 0)
+            battery_state = 2;
+    }
+
+    const gboolean charging = (battery_state == 1 || battery_state == 2);
+    gint cell_info_interval = (display || charging) ?
+                               self->cell_info_interval_short_ms :
+                               self->cell_info_interval_long_ms;
+
+    ofono_slot_set_cell_info_update_interval(self->slot, self, cell_info_interval);
+
+    return G_SOURCE_CONTINUE;
+}
+
+
+static
 void
 binder_devmon_if_io_free(
     BinderDevmonIo* io)
@@ -279,8 +325,13 @@ binder_devmon_if_start_io(
     self->cell_info_interval_short_ms = impl->cell_info_interval_short_ms;
     self->cell_info_interval_long_ms = impl->cell_info_interval_long_ms;
 
+    self->upower = impl->upower;
+
     binder_devmon_if_io_set_indication_filter(self);
     binder_devmon_if_io_set_cell_info_update_interval(self);
+
+    g_timeout_add_seconds(5, binder_devmon_if_io_batman_powersave, self);
+
     return &self->pub;
 }
 
@@ -294,6 +345,7 @@ binder_devmon_if_free(
     mce_battery_unref(self->battery);
     mce_charger_unref(self->charger);
     mce_display_unref(self->display);
+    g_object_unref(self->upower);
     g_free(self);
 }
 
@@ -312,6 +364,7 @@ binder_devmon_if_new(
     self->battery = mce_battery_new();
     self->charger = mce_charger_new();
     self->display = mce_display_new();
+    self->upower = up_client_new();
     self->cell_info_interval_short_ms = config->cell_info_interval_short_ms;
     self->cell_info_interval_long_ms = config->cell_info_interval_long_ms;
     return &self->pub;
