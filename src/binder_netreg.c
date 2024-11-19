@@ -1334,8 +1334,11 @@ int
 binder_netreg_dbm_from_rssi(
     int rssi)
 {
+    const char *mtk_rssi = getenv("OFONO_BINDER_PLUGIN_MTK_RSSI");
+    int multiplier = mtk_rssi ? 4 : 2;
+
     return (rssi >= RSSI_MIN && rssi <= RSSI_MAX) ?
-        (-113 + 2 * (rssi - RSSI_MIN)) : -140;
+        (-113 + multiplier * (rssi - RSSI_MIN)) : -140;
 }
 
 /*
