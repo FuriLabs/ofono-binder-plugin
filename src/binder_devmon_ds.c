@@ -32,6 +32,13 @@
 
 #include <batman/batman-wrappers.h>
 
+#include <sys/inotify.h>
+#include <limits.h>
+#include <errno.h>
+
+#define BATMAN_SCREEN_PATH "/var/lib/batman/screen"
+#define EVENT_BUF_LEN     (10 * (sizeof(struct inotify_event) + NAME_MAX + 1))
+
 enum binder_devmon_ds_battery_event {
     BATTERY_EVENT_VALID,
     BATTERY_EVENT_STATUS,
@@ -88,6 +95,9 @@ typedef struct binder_devmon_ds_io {
     int cell_info_interval_short_ms;
     int cell_info_interval_long_ms;
     UpClient* upower;
+    int batman_inotify_fd;
+    int batman_screen_wd;
+    guint batman_watch_source;
 } DevMonIo;
 
 #define DBG_(self,fmt,args...) \
@@ -292,40 +302,78 @@ binder_devmon_ds_io_charger_cb(
 
 static
 gboolean
-binder_devmon_ds_io_batman_powersave(
-   gpointer user_data)
+handle_batman_inotify_events_ds(
+    GIOChannel* channel,
+    GIOCondition condition,
+    gpointer user_data)
 {
-    DevMonIo* self = (DevMonIo*)user_data;
-    const gchar *state;
-    int display = 0;
-    int battery_state = -1;
+    DevMonIo* self = user_data;
 
-    /* would be nice to have a dbus system service that reports status of session instead of this */
-    FILE *screen_file = fopen("/var/lib/batman/screen", "r");
+    if (channel) {
+        gchar buf[EVENT_BUF_LEN];
+        gsize bytes_read;
+        GError* error = NULL;
+
+        if (condition & (G_IO_HUP | G_IO_ERR | G_IO_NVAL)) {
+            DBG_(self, "inotify watch failed, condition: %d", condition);
+            self->batman_watch_source = 0;
+            return G_SOURCE_REMOVE;
+        }
+
+        GIOStatus status = g_io_channel_read_chars(channel, buf, sizeof(buf),
+            &bytes_read, &error);
+
+        if (status == G_IO_STATUS_ERROR) {
+            if (error) {
+                DBG_(self, "inotify read failed, error: %s", error->message);
+                g_error_free(error);
+            }
+            self->batman_watch_source = 0;
+            return G_SOURCE_REMOVE;
+        }
+
+        if (bytes_read == 0) {
+            DBG_(self, "No bytes read from inotify");
+            return G_SOURCE_CONTINUE;
+        }
+    }
+
+    int state = BATMAN_UNKNOWN;
+    int display = 0;
+
+    FILE *screen_file = fopen(BATMAN_SCREEN_PATH, "r");
     if (screen_file != NULL) {
         char screen_state[4];
         if (fgets(screen_state, sizeof(screen_state), screen_file) != NULL) {
             if (strncmp(screen_state, "yes", 3) == 0)
                 display = 1;
+            DBG_(self, "screen state: %s", screen_state);
+        } else {
+            DBG_(self, "Failed to read screen state");
         }
         fclose(screen_file);
+    } else {
+        DBG_(self, "Failed to open screen state file: %s", strerror(errno));
     }
 
-    state = findBattery(self->upower, NULL);
-    if (state != NULL) {
-        if (strcmp(state, "discharging") == 0)
-            battery_state = 0;
-        else if (strcmp(state, "charging") == 0)
-            battery_state = 1;
-        else if (strcmp(state, "fully-charged") == 0)
-            battery_state = 2;
-    }
+    state = get_battery_state(self->upower);
+    DBG_(self, "Battery state: %s",
+         state == BATMAN_NO_BATTERY ? "no battery" :
+         state == BATMAN_CHARGING ? "charging" :
+         state == BATMAN_DISCHARGING ? "discharging" :
+         state == BATMAN_FULLY_CHARGED ? "fully charged" : "unknown");
 
-    const gboolean low_data = (display == 0 && battery_state == 0);
+    // Handle low data state changes
+    const gboolean low_data = (display == 0 && state == BATMAN_DISCHARGING);
     if (self->low_data != low_data) {
-        DBG_(self, "Screen state: %s\n", display ? "on" : "off");
+        DBG_(self, "Low data changed from %s to %s (screen:%d battery:%s)",
+             self->low_data ? "true" : "false", low_data ? "true" : "false",
+             display,
+             state == BATMAN_NO_BATTERY ? "no battery" :
+             state == BATMAN_CHARGING ? "charging" :
+             state == BATMAN_DISCHARGING ? "discharging" :
+             state == BATMAN_FULLY_CHARGED ? "fully charged" : "unknown");
         self->low_data = low_data;
-        DBG_(self, "Low data is%s expected", low_data ? "" : " not");
         if (self->low_data_supported) {
             radio_request_drop(self->low_data_req);
             self->low_data_req = binder_devmon_ds_io_send_device_state(self,
@@ -334,10 +382,12 @@ binder_devmon_ds_io_batman_powersave(
         }
     }
 
-    const gboolean charging = (battery_state == 1 || battery_state == 2);
+    // Handle charging state changes
+    const gboolean charging = (state == BATMAN_CHARGING || state == BATMAN_FULLY_CHARGED);
     if (self->charging != charging) {
+        DBG_(self, "Charging changed from %s to %s",
+             self->charging ? "true" : "false", charging ? "true" : "false");
         self->charging = charging;
-        DBG_(self, "Charging %s", charging ? "on" : "off");
         if (self->charging_supported) {
             radio_request_drop(self->charging_req);
             self->charging_req = binder_devmon_ds_io_send_device_state(self,
@@ -350,10 +400,56 @@ binder_devmon_ds_io_batman_powersave(
                                self->cell_info_interval_short_ms :
                                self->cell_info_interval_long_ms;
 
-    ofono_slot_set_cell_info_update_interval(self->slot, self, cell_info_interval);
+    DBG_(self, "Setting cell info interval: %d (display:%d charging:%d)",
+         cell_info_interval, display, charging);
 
+    ofono_slot_set_cell_info_update_interval(self->slot, self, cell_info_interval);
     return G_SOURCE_CONTINUE;
 }
+
+static
+void
+binder_devmon_ds_io_init_batman_watch(
+    DevMonIo* self)
+{
+    GIOChannel* channel;
+
+    self->batman_inotify_fd = inotify_init();
+    if (self->batman_inotify_fd < 0) {
+        DBG_(self, "Failed to initialize inotify: %s", strerror(errno));
+        return;
+    }
+
+    DBG_(self, "inotify initialized successfully, fd=%d", self->batman_inotify_fd);
+
+    self->batman_screen_wd = inotify_add_watch(self->batman_inotify_fd,
+        BATMAN_SCREEN_PATH, IN_MODIFY | IN_CLOSE_WRITE);
+
+    if (self->batman_screen_wd < 0) {
+        DBG_(self, "Failed to add watch: %s", strerror(errno));
+        close(self->batman_inotify_fd);
+        self->batman_inotify_fd = -1;
+        return;
+    }
+
+    DBG_(self, "watcher successfully added, wd=%d", self->batman_screen_wd);
+
+    channel = g_io_channel_unix_new(self->batman_inotify_fd);
+    g_io_channel_set_encoding(channel, NULL, NULL);
+    g_io_channel_set_flags(channel, G_IO_FLAG_NONBLOCK, NULL);
+    g_io_channel_set_buffered(channel, FALSE);
+
+    self->batman_watch_source = g_io_add_watch(channel,
+        G_IO_IN | G_IO_HUP | G_IO_ERR | G_IO_NVAL,
+        handle_batman_inotify_events_ds, self);
+
+    DBG_(self, "GIO watcher added, source=%u", self->batman_watch_source);
+
+    g_io_channel_unref(channel);
+
+    handle_batman_inotify_events_ds(NULL, G_IO_IN, self);
+}
+
 
 static
 void
@@ -380,6 +476,14 @@ binder_devmon_ds_io_free(
 
     ofono_slot_drop_cell_info_requests(self->slot, self);
     ofono_slot_unref(self->slot);
+
+    if (self->batman_watch_source)
+        g_source_remove(self->batman_watch_source);
+    if (self->batman_screen_wd >= 0)
+        inotify_rm_watch(self->batman_inotify_fd, self->batman_screen_wd);
+    if (self->batman_inotify_fd >= 0)
+        close(self->batman_inotify_fd);
+
     g_free(self);
 }
 
@@ -442,7 +546,7 @@ binder_devmon_ds_start_io(
     binder_devmon_ds_io_update_charging(self);
     binder_devmon_ds_io_set_cell_info_update_interval(self);
 
-    g_timeout_add_seconds(5, binder_devmon_ds_io_batman_powersave, self);
+    binder_devmon_ds_io_init_batman_watch(self);
 
     return &self->pub;
 }
