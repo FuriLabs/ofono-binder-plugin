@@ -31,6 +31,8 @@
 
 #include <batman/batman-wrappers.h>
 
+#define BATMAN_SCREEN_PATH "/var/lib/batman/screen"
+
 enum binder_devmon_if_battery_event {
     BATTERY_EVENT_VALID,
     BATTERY_EVENT_STATUS,
@@ -222,35 +224,40 @@ binder_devmon_if_io_batman_powersave(
    gpointer user_data)
 {
     DevMonIo* self = (DevMonIo*)user_data;
-    const gchar *state;
+
     int display = 0;
-    int battery_state = -1;
+    int state = BATMAN_UNKNOWN;
 
     /* would be nice to have a dbus system service that reports status of session instead of this */
-    FILE *screen_file = fopen("/var/lib/batman/screen", "r");
+    FILE *screen_file = fopen(BATMAN_SCREEN_PATH, "r");
     if (screen_file != NULL) {
         char screen_state[4];
         if (fgets(screen_state, sizeof(screen_state), screen_file) != NULL) {
             if (strncmp(screen_state, "yes", 3) == 0)
                 display = 1;
+            DBG_(self, "screen state: %s", screen_state);
+        } else {
+            DBG_(self, "Failed to read screen state");
         }
         fclose(screen_file);
+    } else {
+        DBG_(self, "Failed to open screen state file: %s", strerror(errno));
     }
 
-    state = findBattery(self->upower, NULL);
-    if (state != NULL) {
-        if (strcmp(state, "discharging") == 0)
-            battery_state = 0;
-        else if (strcmp(state, "charging") == 0)
-            battery_state = 1;
-        else if (strcmp(state, "fully-charged") == 0)
-            battery_state = 2;
-    }
+    state = get_battery_state(self->upower);
+    DBG_(self, "Battery state: %s",
+         state == BATMAN_NO_BATTERY ? "no battery" :
+         state == BATMAN_CHARGING ? "charging" :
+         state == BATMAN_DISCHARGING ? "discharging" :
+         state == BATMAN_FULLY_CHARGED ? "fully charged" : "unknown");
 
-    const gboolean charging = (battery_state == 1 || battery_state == 2);
+    const gboolean charging = (state == 1 || state == 2);
     gint cell_info_interval = (display || charging) ?
                                self->cell_info_interval_short_ms :
                                self->cell_info_interval_long_ms;
+
+    DBG_(self, "Setting cell info interval: %d (display:%d charging:%d)",
+         cell_info_interval, display, charging);
 
     ofono_slot_set_cell_info_update_interval(self->slot, self, cell_info_interval);
 

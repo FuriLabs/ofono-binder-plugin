@@ -32,6 +32,8 @@
 
 #include <batman/batman-wrappers.h>
 
+#define BATMAN_SCREEN_PATH "/var/lib/batman/screen"
+
 enum binder_devmon_ds_battery_event {
     BATTERY_EVENT_VALID,
     BATTERY_EVENT_STATUS,
@@ -296,36 +298,44 @@ binder_devmon_ds_io_batman_powersave(
    gpointer user_data)
 {
     DevMonIo* self = (DevMonIo*)user_data;
-    const gchar *state;
+
     int display = 0;
-    int battery_state = -1;
+    int state = BATMAN_UNKNOWN;
 
     /* would be nice to have a dbus system service that reports status of session instead of this */
-    FILE *screen_file = fopen("/var/lib/batman/screen", "r");
+    FILE *screen_file = fopen(BATMAN_SCREEN_PATH, "r");
     if (screen_file != NULL) {
         char screen_state[4];
         if (fgets(screen_state, sizeof(screen_state), screen_file) != NULL) {
             if (strncmp(screen_state, "yes", 3) == 0)
                 display = 1;
+            DBG_(self, "screen state: %s", screen_state);
+        } else {
+            DBG_(self, "Failed to read screen state");
         }
         fclose(screen_file);
+    } else {
+        DBG_(self, "Failed to open screen state file: %s", strerror(errno));
     }
 
-    state = findBattery(self->upower, NULL);
-    if (state != NULL) {
-        if (strcmp(state, "discharging") == 0)
-            battery_state = 0;
-        else if (strcmp(state, "charging") == 0)
-            battery_state = 1;
-        else if (strcmp(state, "fully-charged") == 0)
-            battery_state = 2;
-    }
+    state = get_battery_state(self->upower);
+    DBG_(self, "Battery state: %s",
+         state == BATMAN_NO_BATTERY ? "no battery" :
+         state == BATMAN_CHARGING ? "charging" :
+         state == BATMAN_DISCHARGING ? "discharging" :
+         state == BATMAN_FULLY_CHARGED ? "fully charged" : "unknown");
 
-    const gboolean low_data = (display == 0 && battery_state == 0);
+    // Handle low data state changes
+    const gboolean low_data = (display == 0 && state == BATMAN_DISCHARGING);
     if (self->low_data != low_data) {
-        DBG_(self, "Screen state: %s\n", display ? "on" : "off");
+        DBG_(self, "Low data changed from %s to %s (screen:%d battery:%s)",
+             self->low_data ? "true" : "false", low_data ? "true" : "false",
+             display,
+             state == BATMAN_NO_BATTERY ? "no battery" :
+             state == BATMAN_CHARGING ? "charging" :
+             state == BATMAN_DISCHARGING ? "discharging" :
+             state == BATMAN_FULLY_CHARGED ? "fully charged" : "unknown");
         self->low_data = low_data;
-        DBG_(self, "Low data is%s expected", low_data ? "" : " not");
         if (self->low_data_supported) {
             radio_request_drop(self->low_data_req);
             self->low_data_req = binder_devmon_ds_io_send_device_state(self,
@@ -334,10 +344,13 @@ binder_devmon_ds_io_batman_powersave(
         }
     }
 
-    const gboolean charging = (battery_state == 1 || battery_state == 2);
+
+    // Handle charging state changes
+    const gboolean charging = (state == BATMAN_CHARGING || state == BATMAN_FULLY_CHARGED);
     if (self->charging != charging) {
+        DBG_(self, "Charging changed from %s to %s",
+             self->charging ? "true" : "false", charging ? "true" : "false");
         self->charging = charging;
-        DBG_(self, "Charging %s", charging ? "on" : "off");
         if (self->charging_supported) {
             radio_request_drop(self->charging_req);
             self->charging_req = binder_devmon_ds_io_send_device_state(self,
@@ -349,6 +362,9 @@ binder_devmon_ds_io_batman_powersave(
     gint cell_info_interval = (display || charging) ?
                                self->cell_info_interval_short_ms :
                                self->cell_info_interval_long_ms;
+
+    DBG_(self, "Setting cell info interval: %d (display:%d charging:%d)",
+         cell_info_interval, display, charging);
 
     ofono_slot_set_cell_info_update_interval(self->slot, self, cell_info_interval);
 
