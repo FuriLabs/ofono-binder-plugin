@@ -1,9 +1,9 @@
 Source: ofono-binder-plugin
 Section: libs
 Priority: optional
-Maintainer: Eugenio Paolantonio (g7) <me@medesimo.eu>
+Maintainer: Bardia Moshiri <bardia@furilabs.com>
 XSBC-Original-Maintainer: Slava Monich <slava.monich@jolla.com>
-Build-Depends: debhelper,
+Build-Depends: debhelper-compat (= 13),
                libglib2.0-dev (>= 2.0),
                libgbinder-dev (>= 1.1.29),
                libgbinder-radio-dev (>= 1.5.3),
@@ -13,7 +13,7 @@ Build-Depends: debhelper,
                libupower-glib-dev,
                batman-dev (>= 33),
                libbatman-wrappers (>= 33),
-Standards-Version: 3.8.4
+Standards-Version: 4.7.0
 
 Package: ofono-binder-plugin
 Architecture: any
@@ -47,5 +47,6 @@ Package: libofonobinderpluginext-dev
 Section: libdevel
 Architecture: any
 Multi-Arch: same
-Depends: libofonobinderpluginext (= ${binary:Version}), ${misc:Depends}
+Depends: libofonobinderpluginext (= ${binary:Version}),
+         ${misc:Depends},
 Description: Development files for ofono-binder-plugin extensions

@@ -10,7 +10,7 @@ else
 	NUMJOBS := 1
 endif
 
-PLUGINDIR=$(shell pkg-config ofono --variable=plugindir)
+PLUGINDIR=/usr/lib/$(shell dpkg-architecture -qDEB_HOST_MULTIARCH)/ofono/plugins
 LIBDIR=/usr/lib/$(shell dpkg-architecture -qDEB_HOST_MULTIARCH)
 INCLUDEDIR=/usr/include/$(shell dpkg-architecture -qDEB_HOST_MULTIARCH)
 
