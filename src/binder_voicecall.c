@@ -1,6 +1,7 @@
 /*
  *  oFono - Open Source Telephony - binder based adaptation
  *
+ *  Copyright (C) 2024 Slava Monich <slava@monich.com>
  *  Copyright (C) 2021-2022 Jolla Ltd.
  *
  *  This program is free software; you can redistribute it and/or modify
@@ -22,11 +23,12 @@
 #include "binder_ext_slot.h"
 #include "binder_ext_call.h"
 
-#include <ofono/log.h>
+#include <ofono/ims.h>
 #include <ofono/misc.h>
 #include <ofono/voicecall.h>
 
 #include <radio_client.h>
+#include <radio_instance.h>
 #include <radio_request.h>
 #include <radio_request_group.h>
 #include <radio_util.h>
@@ -55,6 +57,7 @@ enum binder_voicecall_ext_events {
     VOICECALL_EXT_CALL_STATE_CHANGED,
     VOICECALL_EXT_CALL_DISCONNECTED,
     VOICECALL_EXT_CALL_SUPP_SVC_NOTIFICATION,
+    VOICECALL_EXT_CALL_RINGBACK_TONE,
     VOICECALL_EXT_EVENT_COUNT
 };
 
@@ -64,7 +67,10 @@ typedef struct binder_voicecall {
     GSList* calls;
     BinderExtCall* ext;
     BinderImsReg* ims_reg;
+    RadioInstance* instance;
     RadioRequestGroup* g;
+    RadioClient* network_client;
+    RADIO_AIDL_INTERFACE interface_aidl;
     ofono_voicecall_cb_t cb;
     void* data;
     GUtilIntArray* local_release_ids;
@@ -264,6 +270,70 @@ binder_voicecall_info_new(
 
 static
 BinderVoiceCallInfo*
+binder_voicecall_info_new_aidl(
+    GBinderReader* reader)
+{
+    BinderVoiceCallInfo* call = g_slice_new0(BinderVoiceCallInfo);
+    struct ofono_call* oc = &call->oc;
+    gboolean is_mt;
+    gboolean is_voice;
+    char* name;
+    char* number;
+
+    gsize address_parcel_size = binder_read_parcelable_size(reader);
+
+    ofono_call_init(oc);
+    if (address_parcel_size) {
+        gsize address_data_read;
+        gsize address_initial_size = gbinder_reader_bytes_read(reader);
+
+        gbinder_reader_read_uint32(reader, &oc->status);
+        gbinder_reader_read_uint32(reader, &oc->id);
+        gbinder_reader_read_int32(reader, &oc->phone_number.type);
+        gbinder_reader_read_bool(reader, NULL); /* isMpty */
+        gbinder_reader_read_bool(reader, &is_mt);
+        oc->direction = is_mt ?
+            OFONO_CALL_DIRECTION_MOBILE_TERMINATED :
+            OFONO_CALL_DIRECTION_MOBILE_ORIGINATED;
+        gbinder_reader_read_int32(reader, NULL); /* als */
+        gbinder_reader_read_bool(reader, &is_voice);
+        oc->type = is_voice ?
+            OFONO_CALL_MODE_VOICE :
+            OFONO_CALL_MODE_UNKNOWN;
+        gbinder_reader_read_bool(reader, NULL);
+        number = gbinder_reader_read_string16(reader);
+        if (number && strlen(number)) {
+            oc->clip_validity = OFONO_CLIP_VALIDITY_VALID;
+            g_strlcpy(oc->phone_number.number, number,
+                OFONO_MAX_PHONE_NUMBER_LENGTH);
+        } else {
+            oc->clip_validity = OFONO_CLIP_VALIDITY_NOT_AVAILABLE;
+        }
+        gbinder_reader_read_int32(reader, NULL); /* als */
+        name = gbinder_reader_read_string16(reader);
+        if (name && strlen(name)) {
+            g_strlcpy(oc->name, name, OFONO_MAX_CALLER_NAME_LENGTH);
+        }
+
+        // Ignore rest of values for now
+        address_data_read = gbinder_reader_bytes_read(reader) - address_initial_size;
+        while (address_data_read < address_parcel_size) {
+            gbinder_reader_read_uint32(reader, NULL);
+            address_data_read += sizeof(guint32);
+        }
+
+        DBG("[id=%d,status=%d,type=%d,number=%s,name=%s]", oc->id,
+            oc->status, oc->type, oc->phone_number.number, oc->name);
+
+        g_free(name);
+        g_free(number);
+    }
+
+    return call;
+}
+
+static
+BinderVoiceCallInfo*
 binder_voicecall_info_ext_new(
     const BinderExtCallInfo* ci,
     BinderExtCall* ext)
@@ -301,16 +371,22 @@ binder_voicecall_info_ext_new(
 }
 
 static
-const BinderVoiceCallInfo*
-binder_voicecall_list_find_call_with_id(
+GSList*
+binder_voicecall_list_find_call_link_with_id(
     GSList* list,
     guint call_id)
 {
-    for (GSList* l = list; l; l = l->next) {
+    GSList* l;
+
+    /*
+     * Normally, the list is either empty or very short, there's
+     * nothing to optimize.
+     */
+    for (l = list; l; l = l->next) {
         const BinderVoiceCallInfo* call = l->data;
 
         if (call->oc.id == call_id) {
-            return call;
+            return l;
         }
     }
     return NULL;
@@ -318,34 +394,30 @@ binder_voicecall_list_find_call_with_id(
 
 static
 GSList*
-binder_voicecall_merge_call_lists(
+binder_voicecall_merge_ext_calls(
     BinderVoiceCall* self,
-    GSList* new_list,
-    gboolean add_ext)
+    GSList* list,
+    gboolean keep_ext)
 {
+    GSList* l;
+
     /*
      * Since IRadio and ext may have different lists of calls,
-     * attempt to merge the ongoing calls initiated by the other
-     * component before current calls list is going to
-     * be replaced by the new list.
+     * merge the ongoing calls initiated by the other component
+     * before the current list of calls is going to be replaced
+     * with the new list.
      */
-    if (!self->ext)
-        return new_list;
-
-    for (GSList* l = self->calls; l; l = l->next) {
+    for (l = self->calls; l; l = l->next) {
         const BinderVoiceCallInfo* call = l->data;
 
-        if (!!call->ext == add_ext) {
-            if (binder_voicecall_list_find_call_with_id(new_list, call->oc.id))
-                continue;
-
-            new_list = g_slist_insert_sorted(new_list,
+        if (!!call->ext == keep_ext &&
+            !binder_voicecall_list_find_call_link_with_id(list, call->oc.id)) {
+            list = g_slist_insert_sorted(list,
                 g_slice_dup(BinderVoiceCallInfo, call),
                 binder_voicecall_info_compare);
         }
     }
-
-    return new_list;
+    return list;
 }
 
 static
@@ -395,20 +467,7 @@ binder_voicecall_find_call_link_with_id(
     BinderVoiceCall* self,
     guint call_id)
 {
-    GSList* l;
-
-    /*
-     * Normally, the list is either empty or very short, there's
-     * nothing to optimize.
-     */
-    for (l = self->calls; l; l = l->next) {
-        const BinderVoiceCallInfo* call = l->data;
-
-        if (call->oc.id == call_id) {
-            return l;
-        }
-    }
-    return NULL;
+    return binder_voicecall_list_find_call_link_with_id(self->calls, call_id);
 }
 
 static
@@ -532,23 +591,40 @@ binder_voicecall_lastcause_cb(
 
     if (status == RADIO_TX_STATUS_OK) {
         if (error == RADIO_ERROR_NONE) {
-            if (resp == RADIO_RESP_GET_LAST_CALL_FAIL_CAUSE) {
+            guint32 code = self->interface_aidl == RADIO_VOICE_INTERFACE ?
+                RADIO_VOICE_RESP_GET_LAST_CALL_FAIL_CAUSE :
+                RADIO_RESP_GET_LAST_CALL_FAIL_CAUSE;
+
+            if (resp == code) {
                 GBinderReader reader;
-                const RadioLastCallFailCauseInfo* info;
+                /*
+                 * Cause code 0 is invalid and can be used to check if code was
+                 * obtained.
+                 */
+                gint32 cause_code = 0;
 
                 /*
                  * getLastCallFailCauseResponse(RadioResponseInfo,
                  *   LastCallFailCauseInfo failCauseinfo);
                  */
                 gbinder_reader_copy(&reader, args);
-                info = gbinder_reader_read_hidl_struct(&reader,
-                    RadioLastCallFailCauseInfo);
-                if (info) {
+                if (self->interface_aidl == RADIO_AIDL_INTERFACE_NONE) {
+                    const RadioLastCallFailCauseInfo* info =
+                        gbinder_reader_read_hidl_struct(&reader,
+                            RadioLastCallFailCauseInfo);
+                    if (info) {
+                        cause_code = info->causeCode;
+                    }
+                } else {
+                    gbinder_reader_read_int32(&reader, &cause_code);
+                    gbinder_reader_skip_string16(&reader);
+                }
+                if (cause_code) {
                     enum ofono_disconnect_reason reason =
-                        binder_voicecall_map_cause(self, cid, info->causeCode);
+                        binder_voicecall_map_cause(self, cid, cause_code);
 
                     ofono_info("Call %d ended with cause %d -> ofono reason %d",
-                        cid, info->causeCode, reason);
+                        cid, cause_code, reason);
                     ofono_voicecall_disconnected(vc, cid, reason, NULL);
                     return;
                 }
@@ -593,8 +669,11 @@ binder_voicecall_set_calls(
                 BinderVoiceCallLastCauseData* reqdata =
                     g_new0(BinderVoiceCallLastCauseData, 1);
                 /* getLastCallFailCause(int32 serial); */
+                guint32 code = self->interface_aidl == RADIO_VOICE_INTERFACE ?
+                    RADIO_VOICE_REQ_GET_LAST_CALL_FAIL_CAUSE :
+                    RADIO_REQ_GET_LAST_CALL_FAIL_CAUSE;
                 RadioRequest* req2 = radio_request_new2(self->g,
-                    RADIO_REQ_GET_LAST_CALL_FAIL_CAUSE, NULL,
+                    code, NULL,
                     binder_voicecall_lastcause_cb, g_free, reqdata);
 
                 reqdata->self = self;
@@ -657,38 +736,54 @@ binder_voicecall_clcc_poll_cb(
     if (status == RADIO_TX_STATUS_OK) {
         if (error == RADIO_ERROR_NONE) {
             GBinderReader reader;
-            gsize i, count = 0;
+            gsize i;
 
             /* getCurrentCallsResponse(RadioResponseInfo, vec<Call> calls); */
             gbinder_reader_copy(&reader, args);
-            if (resp == RADIO_RESP_GET_CURRENT_CALLS) {
-                const RadioCall* calls =
-                    gbinder_reader_read_hidl_type_vec(&reader,
-                        RadioCall, &count);
 
-                if (calls) {
-                    /* Build sorted list */
-                    for (i = 0; i < count; i++) {
-                        list = g_slist_insert_sorted(list,
-                            binder_voicecall_info_new(calls + i),
-                            binder_voicecall_info_compare);
-                    }
-                }
-            } else if (resp == RADIO_RESP_GET_CURRENT_CALLS_1_2) {
-                const RadioCall_1_2* calls =
-                    gbinder_reader_read_hidl_type_vec(&reader,
-                        RadioCall_1_2, &count);
+            if (self->interface_aidl == RADIO_AIDL_INTERFACE_NONE) {
+                gsize count = 0;
+                if (resp == RADIO_RESP_GET_CURRENT_CALLS) {
+                    const RadioCall* calls =
+                        gbinder_reader_read_hidl_type_vec(&reader,
+                            RadioCall, &count);
 
-                if (calls) {
-                    /* Build sorted list */
-                    for (i = 0; i < count; i++) {
-                        list = g_slist_insert_sorted(list,
-                            binder_voicecall_info_new(&calls[i].base),
-                            binder_voicecall_info_compare);
+                    if (calls) {
+                        /* Build sorted list */
+                        for (i = 0; i < count; i++) {
+                            list = g_slist_insert_sorted(list,
+                                binder_voicecall_info_new(calls + i),
+                                binder_voicecall_info_compare);
+                        }
                     }
+                } else if (resp == RADIO_RESP_GET_CURRENT_CALLS_1_2) {
+                    const RadioCall_1_2* calls =
+                        gbinder_reader_read_hidl_type_vec(&reader,
+                            RadioCall_1_2, &count);
+
+                    if (calls) {
+                        /* Build sorted list */
+                        for (i = 0; i < count; i++) {
+                            list = g_slist_insert_sorted(list,
+                                binder_voicecall_info_new(&calls[i].base),
+                                binder_voicecall_info_compare);
+                        }
+                    }
+                } else {
+                    ofono_error("Unexpected getCurrentCalls response %d", resp);
                 }
             } else {
-                ofono_error("Unexpected getCurrentCalls response %d", resp);
+                if ((RADIO_VOICE_RESP)resp == RADIO_VOICE_RESP_GET_CURRENT_CALLS) {
+                    gint32 count = 0;
+                    gbinder_reader_read_int32(&reader, &count);
+                    for (i = 0; i < count; i++) {
+                        list = g_slist_insert_sorted(list,
+                            binder_voicecall_info_new_aidl(&reader),
+                            binder_voicecall_info_compare);
+                    }
+                } else {
+                    ofono_error("Unexpected getCurrentCalls response %d", resp);
+                }
             }
         } else {
             /*
@@ -701,9 +796,8 @@ binder_voicecall_clcc_poll_cb(
     }
 
     /* Merge the ongoing ext calls since IRadio may not report them */
-    list = binder_voicecall_merge_call_lists(self, list, TRUE /*add_ext*/);
-
-    binder_voicecall_set_calls(self, list);
+    binder_voicecall_set_calls(self,
+        binder_voicecall_merge_ext_calls(self, list, TRUE));
 }
 
 static
@@ -735,8 +829,11 @@ binder_voicecall_clcc_poll(
 {
     if (!self->clcc_poll_req) {
         /* getCurrentCalls(int32 serial); */
+        guint32 code = self->interface_aidl == RADIO_VOICE_INTERFACE ?
+            RADIO_VOICE_REQ_GET_CURRENT_CALLS :
+            RADIO_REQ_GET_CURRENT_CALLS;
         RadioRequest* req = radio_request_new2(self->g,
-            RADIO_REQ_GET_CURRENT_CALLS, NULL,
+            code, NULL,
             binder_voicecall_clcc_poll_cb, NULL, self);
 
         radio_request_set_retry(req, BINDER_RETRY_MS, -1);
@@ -861,7 +958,10 @@ binder_voicecall_dial_cb(
 
     if (status == RADIO_TX_STATUS_OK) {
         if (error == RADIO_ERROR_NONE) {
-            if (resp == RADIO_RESP_DIAL) {
+            guint32 code = self->interface_aidl == RADIO_VOICE_INTERFACE ?
+                RADIO_VOICE_RESP_DIAL :
+                RADIO_RESP_DIAL;
+            if (resp == code) {
                 if (self->cb) {
                     /*
                      * CLCC will update the oFono call list with
@@ -912,9 +1012,9 @@ binder_voicecall_ext_dial_cb(
         self->cb = NULL;
         self->data = NULL;
         if (result == BINDER_EXT_CALL_RESULT_OK) {
-            cb(binder_error_failure(&err), cbdata);
-        } else {
             cb(binder_error_ok(&err), cbdata);
+        } else {
+            cb(binder_error_failure(&err), cbdata);
         }
     }
 }
@@ -926,7 +1026,8 @@ binder_voicecall_can_ext_dial(
 {
     return self->ext && (!(binder_ext_call_get_interface_flags
         (self->ext) & BINDER_EXT_CALL_INTERFACE_FLAG_IMS_REQUIRED) ||
-        (self->ims_reg && self->ims_reg->registered));
+        (self->ims_reg && self->ims_reg->registered &&
+        (self->ims_reg->caps & OFONO_IMS_VOICE_CAPABLE)));
 }
 
 static
@@ -961,6 +1062,8 @@ binder_voicecall_dial(
     RadioDial* dialInfo;
     GBinderWriter writer;
     RadioRequest* req;
+    guint32 code = self->interface_aidl == RADIO_VOICE_INTERFACE ?
+        RADIO_VOICE_REQ_DIAL : RADIO_REQ_DIAL;
 
     ofono_info("dialing \"%s\"", phstr);
     DBG_(self, "%s,%d,0", phstr, clir);
@@ -980,24 +1083,40 @@ binder_voicecall_dial(
     }
 
     /* dial(int32 serial, Dial dialInfo) */
-    req = radio_request_new2(self->g, RADIO_REQ_DIAL, &writer,
+    req = radio_request_new2(self->g, code, &writer,
         binder_voicecall_dial_cb, NULL, self);
 
-    /* Prepare the Dial structure */
-    dialInfo = gbinder_writer_new0(&writer, RadioDial);
-    dialInfo->clir = clir;
-    binder_copy_hidl_string(&writer, &dialInfo->address, phstr);
+    if (self->interface_aidl == RADIO_AIDL_INTERFACE_NONE) {
+        /* Prepare the Dial structure */
+        dialInfo = gbinder_writer_new0(&writer, RadioDial);
+        dialInfo->clir = clir;
+        binder_copy_hidl_string(&writer, &dialInfo->address, phstr);
 
-    /* Write the parent structure */
-    parent.index = gbinder_writer_append_buffer_object(&writer, dialInfo,
-        sizeof(*dialInfo));
+        /* Write the parent structure */
+        parent.index = gbinder_writer_append_buffer_object(&writer, dialInfo,
+            sizeof(*dialInfo));
 
-    /* Write the string data */
-    binder_append_hidl_string_data(&writer, dialInfo, address, parent.index);
+        /* Write the string data */
+        binder_append_hidl_string_data(&writer, dialInfo, address, parent.index);
 
-    /* UUS information is empty but we still need to write a buffer */
-    parent.offset = G_STRUCT_OFFSET(RadioDial, uusInfo.data.ptr);
-    gbinder_writer_append_buffer_object_with_parent(&writer, NULL, 0, &parent);
+        /* UUS information is empty but we still need to write a buffer */
+        parent.offset = G_STRUCT_OFFSET(RadioDial, uusInfo.data.ptr);
+        gbinder_writer_append_buffer_object_with_parent(&writer, NULL, 0, &parent);
+    } else {
+        gint32 initial_size;
+        /* Non-null parcelable */
+        gbinder_writer_append_int32(&writer, 1);
+        initial_size = gbinder_writer_bytes_written(&writer);
+        /* Dummy parcelable size, replaced at the end */
+        gbinder_writer_append_int32(&writer, -1);
+        gbinder_writer_append_string16(&writer, phstr);
+        gbinder_writer_append_int32(&writer, clir);
+        /* UUS information array size */
+        gbinder_writer_append_int32(&writer, 0);
+        /* Overwrite parcelable size */
+        gbinder_writer_overwrite_int32(&writer, initial_size,
+            gbinder_writer_bytes_written(&writer) - initial_size);
+    }
 
     /* Submit the request */
     if (radio_request_submit(req)) {
@@ -1031,15 +1150,20 @@ binder_voicecall_submit_hangup_req(
      * work better.
      */
     if (call && call->oc.status == OFONO_CALL_STATUS_INCOMING) {
+        guint32 code = self->interface_aidl == RADIO_VOICE_INTERFACE ?
+            RADIO_VOICE_REQ_HANGUP_WAITING_OR_BACKGROUND :
+            RADIO_REQ_HANGUP_WAITING_OR_BACKGROUND;
         /* hangupWaitingOrBackground(int32_t serial) */
         req = radio_request_new2(self->g,
-            RADIO_REQ_HANGUP_WAITING_OR_BACKGROUND, NULL,
+            code, NULL,
             binder_voicecall_cbd_complete, binder_voicecall_cbd_destroy, cbd);
     } else {
         /* hangup(int32 serial, int32 index) */
         GBinderWriter writer;
+        guint32 code = self->interface_aidl == RADIO_VOICE_INTERFACE ?
+            RADIO_VOICE_REQ_HANGUP : RADIO_REQ_HANGUP;
 
-        req = radio_request_new2(self->g, RADIO_REQ_HANGUP, &writer,
+        req = radio_request_new2(self->g, code, &writer,
             binder_voicecall_cbd_complete, binder_voicecall_cbd_destroy, cbd);
         gbinder_writer_append_int32(&writer, cid);
     }
@@ -1252,14 +1376,10 @@ binder_voicecall_call_state_changed_event(
     RadioClient* client,
     RADIO_IND code,
     const GBinderReader* args,
-    gpointer user_data)
+    gpointer self)
 {
-    BinderVoiceCall* self = user_data;
-
-    GASSERT(code == RADIO_IND_CALL_STATE_CHANGED);
-
     /* Just need to request the call list again */
-    binder_voicecall_clcc_poll(self);
+    binder_voicecall_clcc_poll((BinderVoiceCall*) self);
 }
 
 static
@@ -1306,27 +1426,62 @@ binder_voicecall_supp_svc_notification(
     GBinderReader reader;
 
     gbinder_reader_copy(&reader, args);
-    ssn = gbinder_reader_read_hidl_struct(&reader, RadioSuppSvcNotification);
-    if (ssn) {
-        if (ssn->isMT) {
-            struct ofono_phone_number ph;
+    if (self->interface_aidl == RADIO_AIDL_INTERFACE_NONE) {
+        ssn = gbinder_reader_read_hidl_struct(&reader, RadioSuppSvcNotification);
+        if (ssn) {
+            if (ssn->isMT) {
+                struct ofono_phone_number ph;
 
-            /* MT unsolicited result code */
-            DBG_(self, "MT code: %d, index: %d type: %d number: %s", ssn->code,
-                 ssn->index, ssn->type, ssn->number.data.str);
-            if (ssn->number.data.str && ssn->number.len) {
-                ph.type = ssn->type;
-                g_strlcpy(ph.number, ssn->number.data.str, sizeof(ph.number));
+                /* MT unsolicited result code */
+                DBG_(self, "MT code: %d, index: %d type: %d number: %s", ssn->code,
+                     ssn->index, ssn->type, ssn->number.data.str);
+                if (ssn->number.data.str && ssn->number.len) {
+                    ph.type = ssn->type;
+                    g_strlcpy(ph.number, ssn->number.data.str, sizeof(ph.number));
+                } else {
+                    ph.type = OFONO_NUMBER_TYPE_UNKNOWN;
+                    ph.number[0] = 0;
+                }
+
+                ofono_voicecall_ssn_mt_notify(self->vc, 0, ssn->code,
+                    ssn->index, &ph);
             } else {
-                ph.type = OFONO_NUMBER_TYPE_UNKNOWN;
-                ph.number[0] = 0;
+                /* MO intermediate result code */
+                ofono_voicecall_ssn_mo_notify(self->vc, 0, ssn->code, ssn->index);
             }
+        }
+    } else {
+        if (binder_read_parcelable_size(&reader)) {
+            gboolean is_mt;
+            gint32 code, index, type;
+            char* number;
 
-            ofono_voicecall_ssn_mt_notify(self->vc, 0, ssn->code,
-                ssn->index, &ph);
-        } else {
-            /* MO intermediate result code */
-            ofono_voicecall_ssn_mo_notify(self->vc, 0, ssn->code, ssn->index);
+            gbinder_reader_read_bool(&reader, &is_mt);
+            gbinder_reader_read_int32(&reader, &code);
+            gbinder_reader_read_int32(&reader, &index);
+            gbinder_reader_read_int32(&reader, &type);
+            number = gbinder_reader_read_string16(&reader);
+            if (is_mt) {
+                struct ofono_phone_number ph;
+
+                /* MT unsolicited result code */
+                DBG_(self, "MT code: %d, index: %d type: %d number: %s", code,
+                     index, type, number);
+                if (number && strlen(number)) {
+                    ph.type = type;
+                    g_strlcpy(ph.number, number, sizeof(ph.number));
+                } else {
+                    ph.type = OFONO_NUMBER_TYPE_UNKNOWN;
+                    ph.number[0] = 0;
+                }
+
+                ofono_voicecall_ssn_mt_notify(self->vc, 0, code,
+                    index, &ph);
+            } else {
+                /* MO intermediate result code */
+                ofono_voicecall_ssn_mo_notify(self->vc, 0, code, index);
+            }
+            g_free(number);
         }
     }
 }
@@ -1373,7 +1528,9 @@ binder_voicecall_answer(
     } else {
         /* Default action */
         DBG_(self, "answering current call");
-        binder_voicecall_request_submit(self, RADIO_REQ_ACCEPT_CALL, cbd);
+        guint32 code = self->interface_aidl == RADIO_VOICE_INTERFACE ?
+            RADIO_VOICE_REQ_ACCEPT_CALL : RADIO_REQ_ACCEPT_CALL;
+        binder_voicecall_request_submit(self, code, cbd);
     }
     binder_voicecall_cbd_unref(cbd);
 }
@@ -1396,7 +1553,9 @@ binder_voicecall_send_dtmf_cb(
 
     if (status == RADIO_TX_STATUS_OK) {
         if (error == RADIO_ERROR_NONE) {
-            if (resp == RADIO_RESP_SEND_DTMF) {
+            guint32 code = self->interface_aidl == RADIO_VOICE_INTERFACE ?
+                RADIO_VOICE_RESP_SEND_DTMF : RADIO_RESP_SEND_DTMF;
+            if (resp == code) {
                 /* Send the next one */
                 binder_voicecall_send_one_dtmf(self);
                 return;
@@ -1452,11 +1611,17 @@ binder_voicecall_send_one_dtmf(
         if (!self->ext_send_dtmf_id) {
             /* sendDtmf(int32 serial, string tones) */
             GBinderWriter writer;
+            guint32 code = self->interface_aidl == RADIO_VOICE_INTERFACE ?
+                RADIO_VOICE_REQ_SEND_DTMF : RADIO_REQ_SEND_DTMF;
             RadioRequest* req = radio_request_new2(self->g,
-                RADIO_REQ_SEND_DTMF, &writer,
+                code, &writer,
                 binder_voicecall_send_dtmf_cb, NULL, self);
 
-            gbinder_writer_append_hidl_string_copy(&writer, tone);
+            if (self->interface_aidl == RADIO_AIDL_INTERFACE_NONE) {
+                gbinder_writer_append_hidl_string_copy(&writer, tone);
+            } else {
+                gbinder_writer_append_string16(&writer, tone);
+            }
             if (radio_request_submit(req)) {
                 self->send_dtmf_req = req;
             } else {
@@ -1521,7 +1686,8 @@ binder_voicecall_create_multiparty(
 {
     BinderVoiceCall* self = binder_voicecall_get_data(vc);
     BinderVoiceCallCbData* cbd = binder_voicecall_cbd_new(self, cb, data);
-    const RADIO_REQ req = RADIO_REQ_CONFERENCE;
+    const guint32 req = self->interface_aidl == RADIO_VOICE_INTERFACE ?
+        RADIO_VOICE_REQ_CONFERENCE : RADIO_REQ_CONFERENCE;
 
     if (binder_voicecall_have_ext_call(self)) {
         if (!binder_voicecall_ext_conference(self, cbd)) {
@@ -1565,7 +1731,9 @@ binder_voicecall_transfer(
 {
     BinderVoiceCall* self = binder_voicecall_get_data(vc);
     BinderVoiceCallCbData* cbd = binder_voicecall_cbd_new(self, cb, data);
-    const RADIO_REQ req = RADIO_REQ_EXPLICIT_CALL_TRANSFER;
+    const guint32 req = self->interface_aidl == RADIO_VOICE_INTERFACE ?
+        RADIO_VOICE_REQ_EXPLICIT_CALL_TRANSFER :
+        RADIO_REQ_EXPLICIT_CALL_TRANSFER;
 
     if (binder_voicecall_have_ext_call(self)) {
         if (!binder_voicecall_ext_transfer(self, cbd)) {
@@ -1593,8 +1761,11 @@ binder_voicecall_private_chat(
 
     /* separateConnection(int32 serial, int32 index) */
     GBinderWriter writer;
+    guint32 code = self->interface_aidl == RADIO_VOICE_INTERFACE ?
+        RADIO_VOICE_REQ_SEPARATE_CONNECTION :
+        RADIO_REQ_SEPARATE_CONNECTION;
     RadioRequest* req = radio_request_new2(self->g,
-        RADIO_REQ_SEPARATE_CONNECTION, &writer,
+        code, &writer,
         binder_voicecall_cbd_complete, binder_voicecall_cbd_destroy, cbd);
 
     DBG_(self, "Private chat with id %d", cid);
@@ -1639,12 +1810,12 @@ binder_voicecall_swap_with_fallback(
 
     if (binder_voicecall_have_ext_call(self)) {
         if (!binder_voicecall_ext_swap(self, cbd, flags)) {
-            DBG_(self, "%s (fallback)", radio_req_name(fallback));
+            DBG_(self, "%s (fallback)", radio_req_name2(self->instance, fallback));
             binder_voicecall_request_submit(self, fallback, cbd);
         }
     } else {
         /* Default action */
-        DBG_(self, "%s", radio_req_name(fallback));
+        DBG_(self, "%s", radio_req_name2(self->instance, fallback));
         binder_voicecall_request_submit(self, fallback, cbd);
     }
     binder_voicecall_cbd_unref(cbd);
@@ -1657,8 +1828,12 @@ binder_voicecall_swap_without_accept(
     ofono_voicecall_cb_t cb,
     void* data)
 {
+    BinderVoiceCall* self = binder_voicecall_get_data(vc);
+    guint32 code = self->interface_aidl == RADIO_VOICE_INTERFACE ?
+        RADIO_VOICE_REQ_SWITCH_WAITING_OR_HOLDING_AND_ACTIVE :
+        RADIO_REQ_SWITCH_WAITING_OR_HOLDING_AND_ACTIVE;
     binder_voicecall_swap_with_fallback(vc, BINDER_EXT_CALL_SWAP_NO_FLAGS,
-        RADIO_REQ_SWITCH_WAITING_OR_HOLDING_AND_ACTIVE, cb, data);
+        code, cb, data);
 }
 
 static
@@ -1668,8 +1843,12 @@ binder_voicecall_hold_all_active(
     ofono_voicecall_cb_t cb,
     void* data)
 {
+    BinderVoiceCall* self = binder_voicecall_get_data(vc);
+    guint32 code = self->interface_aidl == RADIO_VOICE_INTERFACE ?
+        RADIO_VOICE_REQ_SWITCH_WAITING_OR_HOLDING_AND_ACTIVE :
+        RADIO_REQ_SWITCH_WAITING_OR_HOLDING_AND_ACTIVE;
     binder_voicecall_swap_with_fallback(vc, BINDER_EXT_CALL_SWAP_NO_FLAGS,
-        RADIO_REQ_SWITCH_WAITING_OR_HOLDING_AND_ACTIVE, cb, data);
+        code, cb, data);
 }
 
 static
@@ -1679,8 +1858,12 @@ binder_voicecall_release_all_active(
     ofono_voicecall_cb_t cb,
     void* data)
 {
+    BinderVoiceCall* self = binder_voicecall_get_data(vc);
+    guint32 code = self->interface_aidl == RADIO_VOICE_INTERFACE ?
+        RADIO_VOICE_REQ_HANGUP_FOREGROUND_RESUME_BACKGROUND :
+        RADIO_REQ_HANGUP_FOREGROUND_RESUME_BACKGROUND;
     binder_voicecall_swap_with_fallback(vc, BINDER_EXT_CALL_SWAP_FLAG_HANGUP,
-        RADIO_REQ_HANGUP_FOREGROUND_RESUME_BACKGROUND, cb, data);
+        code, cb, data);
 }
 
 static
@@ -1721,7 +1904,7 @@ binder_voicecall_hangup_with_fallback(
                         continue;
                     }
                 } else {
-                    DBG_(self, "%s %u", radio_req_name(fallback), id);
+                    DBG_(self, "%s %u", radio_req_name2(self->instance, fallback), id);
                 }
 
                 /* Request wasn't submitted - will use the fallback */
@@ -1730,11 +1913,11 @@ binder_voicecall_hangup_with_fallback(
         }
 
         if (use_fallback || !cbd->pending_call_count) {
-            DBG_(self, "%s", radio_req_name(fallback));
+            DBG_(self, "%s", radio_req_name2(self->instance, fallback));
             binder_voicecall_request_submit(self, fallback, cbd);
         }
     } else {
-        DBG_(self, "%s", radio_req_name(fallback));
+        DBG_(self, "%s", radio_req_name2(self->instance, fallback));
         binder_voicecall_request_submit(self, fallback, cbd);
     }
     binder_voicecall_cbd_unref(cbd);
@@ -1748,10 +1931,14 @@ binder_voicecall_release_all_held(
     void* data)
 {
     DBG__(vc, "");
+    BinderVoiceCall* self = binder_voicecall_get_data(vc);
+    guint32 code = self->interface_aidl == RADIO_VOICE_INTERFACE ?
+        RADIO_VOICE_REQ_HANGUP_WAITING_OR_BACKGROUND :
+        RADIO_REQ_HANGUP_WAITING_OR_BACKGROUND;
     binder_voicecall_hangup_with_fallback(vc,
         binder_voicecall_hangup_filter_held,
         BINDER_EXT_CALL_HANGUP_REJECT,
-        RADIO_REQ_HANGUP_WAITING_OR_BACKGROUND, cb, data);
+        code, cb, data);
 }
 
 static
@@ -1762,10 +1949,13 @@ binder_voicecall_set_udub(
     void* data)
 {
     DBG__(vc, "");
+    BinderVoiceCall* self = binder_voicecall_get_data(vc);
+    guint32 code = self->interface_aidl == RADIO_VOICE_INTERFACE ?
+        RADIO_VOICE_REQ_REJECT_CALL : RADIO_REQ_REJECT_CALL;
     binder_voicecall_hangup_with_fallback(vc,
         binder_voicecall_hangup_filter_incoming_waiting,
         BINDER_EXT_CALL_HANGUP_REJECT,
-        RADIO_REQ_REJECT_CALL, cb, data);
+        code, cb, data);
 }
 
 static
@@ -1774,8 +1964,13 @@ binder_voicecall_enable_supp_svc(
     BinderVoiceCall* self)
 {
     GBinderWriter writer;
-    RadioRequest* req = radio_request_new2(self->g,
-        RADIO_REQ_SET_SUPP_SERVICE_NOTIFICATIONS, &writer,
+    const RADIO_AIDL_INTERFACE iface_aidl =
+        radio_client_aidl_interface(self->network_client);
+    guint32 code = iface_aidl == RADIO_NETWORK_INTERFACE ?
+        RADIO_NETWORK_REQ_SET_SUPP_SERVICE_NOTIFICATIONS :
+        RADIO_REQ_SET_SUPP_SERVICE_NOTIFICATIONS;
+    RadioRequest* req = radio_request_new(self->network_client,
+        code, &writer,
         NULL, NULL, NULL);
 
     /* setSuppServiceNotifications(int32 serial, bool enable); */
@@ -1816,29 +2011,58 @@ binder_voicecall_ecclist_changed(
 {
     BinderVoiceCall* self = user_data;
     GBinderReader reader;
-    gsize count = 0;
-    const RadioEmergencyNumber* list;
-    const char** en_list = NULL;
 
-    /* currentEmergencyNumberList(RadioIndicationType,vec<EmergencyNumber>); */
     gbinder_reader_copy(&reader, args);
-    list = gbinder_reader_read_hidl_type_vec(&reader,
-        RadioEmergencyNumber, &count);
+    if (self->interface_aidl == RADIO_AIDL_INTERFACE_NONE) {
+        /* currentEmergencyNumberList(RadioIndicationType,vec<EmergencyNumber>); */
+        gsize count = 0;
+        const char** en_list = NULL;
+        const RadioEmergencyNumber* list;
+        list = gbinder_reader_read_hidl_type_vec(&reader,
+            RadioEmergencyNumber, &count);
 
-    DBG_(self, "%u emergency number(s)", (guint) count);
-    if (count) {
-        guint i;
+        DBG_(self, "%zu emergency number(s)", count);
+        if (count) {
+            guint i;
 
-        en_list = g_new(const char*, count + 1);
-        for (i = 0; i < count; i++) {
-            en_list[i] = list[i].number.data.str;
-            DBG("%s", en_list[i]);
+            en_list = g_new0(const char*, count + 1);
+            for (i = 0; i < count; i++) {
+                en_list[i] = list[i].number.data.str;
+                DBG("%s", en_list[i]);
+            }
         }
-        en_list[i] = NULL;
-    }
+        ofono_voicecall_en_list_notify(self->vc, (char**) en_list);
+        g_free(en_list);
+    } else {
+        /* currentEmergencyNumberList(RadioIndicationType,EmergencyNumber[]); */
+        gint32 count = 0;
+        gbinder_reader_read_int32(&reader, &count);
+        char** en_list = NULL;
 
-    ofono_voicecall_en_list_notify(self->vc, (char**) en_list);
-    g_free(en_list);
+        DBG_(self, "%zu emergency number(s)", count);
+        if (count) {
+            guint i;
+
+            en_list = g_new0(char*, count + 1);
+            for (i = 0; i < count; i++) {
+                gsize data_read;
+                gsize parcel_size = binder_read_parcelable_size(&reader);
+                gsize initial_size = gbinder_reader_bytes_read(&reader);
+
+                en_list[i] = gbinder_reader_read_string16(&reader);
+
+                // Ignore rest of values for now
+                data_read = gbinder_reader_bytes_read(&reader) - initial_size;
+                while (data_read < parcel_size) {
+                    gbinder_reader_read_uint32(&reader, NULL);
+                    data_read += sizeof(guint32);
+                }
+                DBG("%s", en_list[i]);
+            }
+        }
+        ofono_voicecall_en_list_notify(self->vc, (char**) en_list);
+        g_strfreev(en_list);
+    }
 }
 
 static
@@ -1865,9 +2089,8 @@ binder_voicecall_ext_calls_changed(
     }
 
     /* Merge the IRadio calls back into the list */
-    list = binder_voicecall_merge_call_lists(self, list, FALSE /*add_ext*/);
-
-    binder_voicecall_set_calls(self, list);
+    binder_voicecall_set_calls(self,
+        binder_voicecall_merge_ext_calls(self, list, FALSE));
 }
 
 static
@@ -1898,6 +2121,19 @@ binder_voicecall_ext_call_disconnected(
 
 static
 void
+binder_voicecall_ext_call_ringback_tone(
+    BinderExtCall* ext,
+    gboolean start,
+    void* user_data)
+{
+    BinderVoiceCall* self = user_data;
+
+    DBG_(self, "play ringback tone: %d", start);
+    ofono_voicecall_ringback_tone_notify(self->vc, start);
+}
+
+static
+void
 binder_voicecall_register(
     gpointer user_data)
 {
@@ -1912,33 +2148,59 @@ binder_voicecall_register(
     /* Request supplementary service notifications*/
     binder_voicecall_enable_supp_svc(self);
 
-    /* Unsol when call state changes */
-    self->radio_event[VOICECALL_EVENT_CALL_STATE_CHANGED] =
-        radio_client_add_indication_handler(client,
-            RADIO_IND_CALL_STATE_CHANGED,
-            binder_voicecall_call_state_changed_event, self);
+    if (self->interface_aidl == RADIO_AIDL_INTERFACE_NONE) {
+        /* Unsol when call state changes */
+        self->radio_event[VOICECALL_EVENT_CALL_STATE_CHANGED] =
+            radio_client_add_indication_handler(client,
+                RADIO_IND_CALL_STATE_CHANGED,
+                binder_voicecall_call_state_changed_event, self);
 
-    /* Unsol when call set in hold */
-    self->radio_event[VOICECALL_EVENT_SUPP_SVC_NOTIFICATION] =
-        radio_client_add_indication_handler(client,
-            RADIO_IND_SUPP_SVC_NOTIFY,
-            binder_voicecall_supp_svc_notification, self);
+        /* Unsol when call set in hold */
+        self->radio_event[VOICECALL_EVENT_SUPP_SVC_NOTIFICATION] =
+            radio_client_add_indication_handler(client,
+                RADIO_IND_SUPP_SVC_NOTIFY,
+                binder_voicecall_supp_svc_notification, self);
 
-    /* Register for ringback tone notifications */
-    self->radio_event[VOICECALL_EVENT_RINGBACK_TONE] =
-        radio_client_add_indication_handler(client,
-            RADIO_IND_INDICATE_RINGBACK_TONE,
-            binder_voicecall_ringback_tone_event, self);
+        /* Register for ringback tone notifications */
+        self->radio_event[VOICECALL_EVENT_RINGBACK_TONE] =
+            radio_client_add_indication_handler(client,
+                RADIO_IND_INDICATE_RINGBACK_TONE,
+                binder_voicecall_ringback_tone_event, self);
 
-    /*
-     * This one is IRadio 1.4 specific and we won't actually receive
-     * it unless IRadio 1.4 is actually in use. It's OK to register
-     * the handler unconditionally, though.
-     */
-    self->radio_event[VOICECALL_EVENT_ECCLIST_CHANGED] =
-        radio_client_add_indication_handler(client,
-            RADIO_IND_CURRENT_EMERGENCY_NUMBER_LIST,
-            binder_voicecall_ecclist_changed, self);
+        /*
+         * This one is IRadio 1.4 specific and we won't actually receive
+         * it unless IRadio 1.4 is actually in use. It's OK to register
+         * the handler unconditionally, though.
+         */
+        self->radio_event[VOICECALL_EVENT_ECCLIST_CHANGED] =
+            radio_client_add_indication_handler(client,
+                RADIO_IND_CURRENT_EMERGENCY_NUMBER_LIST,
+                binder_voicecall_ecclist_changed, self);
+    } else {
+        /* Unsol when call state changes */
+        self->radio_event[VOICECALL_EVENT_CALL_STATE_CHANGED] =
+            radio_client_add_indication_handler(client,
+                RADIO_VOICE_IND_CALL_STATE_CHANGED,
+                binder_voicecall_call_state_changed_event, self);
+
+        /* Unsol when call set in hold */
+        self->radio_event[VOICECALL_EVENT_SUPP_SVC_NOTIFICATION] =
+            radio_client_add_indication_handler(self->network_client,
+                RADIO_NETWORK_IND_SUPP_SVC_NOTIFY,
+                binder_voicecall_supp_svc_notification, self);
+
+        /* Register for ringback tone notifications */
+        self->radio_event[VOICECALL_EVENT_RINGBACK_TONE] =
+            radio_client_add_indication_handler(client,
+                RADIO_VOICE_IND_INDICATE_RINGBACK_TONE,
+                binder_voicecall_ringback_tone_event, self);
+
+        /* Register for emergency number list notifications */
+        self->radio_event[VOICECALL_EVENT_ECCLIST_CHANGED] =
+            radio_client_add_indication_handler(client,
+                RADIO_VOICE_IND_CURRENT_EMERGENCY_NUMBER_LIST,
+                binder_voicecall_ecclist_changed, self);
+    }
 
     /* Register extension event handlers if there is an extension */
     if (self->ext) {
@@ -1951,6 +2213,9 @@ binder_voicecall_register(
         self->ext_event[VOICECALL_EXT_CALL_SUPP_SVC_NOTIFICATION] =
             binder_ext_call_add_ssn_handler(self->ext,
                 binder_voicecall_ext_supp_svc_notification, self);
+        self->ext_event[VOICECALL_EXT_CALL_RINGBACK_TONE] =
+            binder_ext_call_add_ringback_tone_handler(self->ext,
+                binder_voicecall_ext_call_ringback_tone, self);
     }
 }
 
@@ -1970,7 +2235,10 @@ binder_voicecall_probe(
 
     self->vc = vc;
     self->dtmf_queue = gutil_ring_new();
-    self->g = radio_request_group_new(modem->client); /* Keeps ref to client */
+    self->instance = radio_instance_ref(modem->instance);
+    self->g = radio_request_group_new(modem->voice_client); /* Keeps ref to client */
+    self->network_client = radio_client_ref(modem->network_client);
+    self->interface_aidl = radio_client_aidl_interface(modem->voice_client);
     self->local_hangup_reasons = gutil_ints_ref(cfg->local_hangup_reasons);
     self->remote_hangup_reasons = gutil_ints_ref(cfg->remote_hangup_reasons);
     self->local_release_ids = gutil_int_array_new();
@@ -2005,6 +2273,8 @@ binder_voicecall_remove(
     radio_client_remove_all_handlers(self->g->client, self->radio_event);
     radio_request_group_cancel(self->g);
     radio_request_group_unref(self->g);
+    radio_client_unref(self->network_client);
+    radio_instance_unref(self->instance);
 
     gutil_ring_unref(self->dtmf_queue);
     gutil_ints_unref(self->local_hangup_reasons);

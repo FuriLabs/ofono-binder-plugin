@@ -2,6 +2,7 @@
  *  oFono - Open Source Telephony - binder based adaptation
  *
  *  Copyright (C) 2022 Jolla Ltd.
+ *  Copyright (C) 2025 Slava Monich <slava@monich.com>
  *
  *  This program is free software; you can redistribute it and/or modify
  *  it under the terms of the GNU General Public License version 2 as
@@ -80,6 +81,8 @@ typedef struct binder_ext_call_interface {
     gulong (*add_ssn_handler)(BinderExtCall* ext,
         BinderExtCallSuppSvcNotifyFunc handler, void* user_data);
     void (*remove_handler)(BinderExtCall* ext, gulong id);
+    gulong (*add_ringback_tone_handler)(BinderExtCall* ext,
+        BinderExtCallRingbackToneFunc handler, void* user_data); /* Since 1.1.22 */
 
     /* Padding for future expansion */
     void (*_reserved1)(void);
@@ -91,7 +94,6 @@ typedef struct binder_ext_call_interface {
     void (*_reserved7)(void);
     void (*_reserved8)(void);
     void (*_reserved9)(void);
-    void (*_reserved10)(void);
 } BinderExtCallInterface;
 
 #define BINDER_EXT_CALL_GET_IFACE(obj) G_TYPE_INSTANCE_GET_INTERFACE(obj,\

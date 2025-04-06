@@ -1,6 +1,6 @@
 Name: ofono-binder-plugin
 
-Version: 1.1.14
+Version: 1.1.22
 Release: 1
 Summary: Binder based ofono plugin
 License: GPLv2
@@ -9,10 +9,11 @@ Source: %{name}-%{version}.tar.bz2
 
 %define libglibutil_version 1.0.61
 %define libgbinder_version 1.1.29
-%define libgbinder_radio_version 1.5.6
+%define libgbinder_radio_version 1.6.0
 %define libmce_version 1.0.6
-%define libofonobinderpluginext_version 1.1.0
-%define ofono_version 1.28+git8
+%define libofonobinderpluginext_version 1.1.22
+%define glib_version 2.32
+%define ofono_version 1.29+git8
 
 BuildRequires: pkgconfig
 BuildRequires: ofono-devel >= %{ofono_version}
@@ -20,11 +21,14 @@ BuildRequires: pkgconfig(libgbinder) >= %{libgbinder_version}
 BuildRequires: pkgconfig(libgbinder-radio) >= %{libgbinder_radio_version}
 BuildRequires: pkgconfig(libglibutil) >= %{libglibutil_version}
 BuildRequires: pkgconfig(libmce-glib) >= %{libmce_version}
-BuildRequires: pkgconfig(glib-2.0)
+BuildRequires: pkgconfig(glib-2.0) >= %{glib_version}
 
 # license macro requires rpm >= 4.11
 BuildRequires: pkgconfig(rpm)
 %define license_support %(pkg-config --exists 'rpm >= 4.11'; echo $?)
+
+# make_build macro appeared in rpm 4.12
+%{!?make_build:%define make_build make %{_smp_mflags}}
 
 Requires: ofono >= %{ofono_version}
 Requires: libofonobinderpluginext >= %{libofonobinderpluginext_version}
@@ -32,6 +36,7 @@ Requires: libgbinder >= %{libgbinder_version}
 Requires: libgbinder-radio >= %{libgbinder_radio_version}
 Requires: libglibutil >= %{libglibutil_version}
 Requires: libmce-glib >= %{libmce_version}
+Requires: glib2 >= %{glib_version}
 
 Conflicts: ofono-ril-plugin
 Obsoletes: ofono-ril-plugin
@@ -48,8 +53,8 @@ Binder plugin for Sailfish OS fork of ofono
 %setup -q -n %{name}-%{version}
 
 %build
-make %{_smp_mflags} PLUGINDIR=%{plugin_dir} KEEP_SYMBOLS=1 release
-make %{_smp_mflags} -C lib LIBDIR=%{_libdir} KEEP_SYMBOLS=1 release pkgconfig
+%make_build PLUGINDIR=%{plugin_dir} KEEP_SYMBOLS=1 release
+%make_build -C lib LIBDIR=%{_libdir} KEEP_SYMBOLS=1 release pkgconfig
 
 %check
 make test
@@ -85,6 +90,7 @@ Requires: pkgconfig(glib-2.0)
 Requires: pkgconfig(libgbinder-radio) >= %{libgbinder_radio_version}
 Requires: pkgconfig(libglibutil) >= %{libglibutil_version}
 Requires: libofonobinderpluginext = %{version}
+Requires: glib2 >= %{glib_version}
 
 %post -n libofonobinderpluginext -p /sbin/ldconfig
 

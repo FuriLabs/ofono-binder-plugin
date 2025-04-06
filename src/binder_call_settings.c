@@ -21,8 +21,10 @@
 #include <ofono/call-settings.h>
 #include <ofono/log.h>
 
+#include <radio_client.h>
 #include <radio_request.h>
 #include <radio_request_group.h>
+#include <radio_voice_types.h>
 
 #include <gbinder_reader.h>
 #include <gbinder_writer.h>
@@ -30,6 +32,7 @@
 typedef struct binder_call_settings {
     struct ofono_call_settings* s;
     RadioRequestGroup* g;
+    RADIO_AIDL_INTERFACE interface_aidl;
     char* log_prefix;
     guint register_id;
 } BinderCallSettings;
@@ -123,10 +126,23 @@ binder_call_settings_cw_set(
 {
     BinderCallSettings* self = binder_call_settings_get_data(s);
 
+    /*
+     * Modem seems to respond with error to all queries
+     * or settings made with bearer class
+     * BEARER_CLASS_DEFAULT. Design decision: If given
+     * class is BEARER_CLASS_DEFAULT let's map it to
+     * SERVICE_CLASS_VOICE effectively making it the
+     * default bearer.
+     */
+    if (cls == BEARER_CLASS_DEFAULT)
+        cls = BEARER_CLASS_VOICE;
+
     /* setCallWaiting(int32_t serial, bool enable, int32_t serviceClass); */
     GBinderWriter writer;
+    guint32 code = self->interface_aidl == RADIO_VOICE_INTERFACE ?
+        RADIO_VOICE_REQ_SET_CALL_WAITING : RADIO_REQ_SET_CALL_WAITING;
     RadioRequest* req = radio_request_new2(self->g,
-        RADIO_REQ_SET_CALL_WAITING, &writer,
+        code, &writer,
         binder_call_settings_set_cb,
         binder_call_settings_callback_data_free,
         binder_call_settings_callback_data_new(self, BINDER_CB(cb), data));
@@ -184,7 +200,9 @@ binder_call_settings_cw_query_cb(
     const BinderCallSettingsCbData* cbd = user_data;
 
     if (status == RADIO_TX_STATUS_OK) {
-        if (resp == RADIO_RESP_GET_CALL_WAITING) {
+        guint32 code = cbd->self->interface_aidl == RADIO_VOICE_INTERFACE ?
+            RADIO_VOICE_RESP_GET_CALL_WAITING : RADIO_RESP_GET_CALL_WAITING;
+        if (resp == code) {
             if (error == RADIO_ERROR_NONE) {
                 if (binder_call_settings_cw_query_ok(cbd, args)) {
                     return;
@@ -208,10 +226,23 @@ void binder_call_settings_cw_query(
 {
     BinderCallSettings* self = binder_call_settings_get_data(s);
 
+    /*
+     * Modem seems to respond with error to all queries
+     * or settings made with bearer class
+     * BEARER_CLASS_DEFAULT. Design decision: If given
+     * class is BEARER_CLASS_DEFAULT let's map it to
+     * SERVICE_CLASS_VOICE effectively making it the
+     * default bearer.
+     */
+    if (cls == BEARER_CLASS_DEFAULT)
+        cls = BEARER_CLASS_VOICE;
+
     /* getCallWaiting(int32_t serial, int32_t serviceClass); */
     GBinderWriter writer;
+    guint32 code = self->interface_aidl == RADIO_VOICE_INTERFACE ?
+        RADIO_VOICE_REQ_GET_CALL_WAITING : RADIO_REQ_GET_CALL_WAITING;
     RadioRequest* req = radio_request_new2(self->g,
-        RADIO_REQ_GET_CALL_WAITING, &writer,
+        code, &writer,
         binder_call_settings_cw_query_cb,
         binder_call_settings_callback_data_free,
         binder_call_settings_callback_data_new(self, BINDER_CB(cb), data));
@@ -255,7 +286,9 @@ binder_call_settings_clip_query_cb(
     const BinderCallSettingsCbData* cbd = user_data;
 
     if (status == RADIO_TX_STATUS_OK) {
-        if (resp == RADIO_RESP_GET_CLIP) {
+        guint32 code = cbd->self->interface_aidl == RADIO_VOICE_INTERFACE ?
+            RADIO_VOICE_RESP_GET_CLIP : RADIO_RESP_GET_CLIP;
+        if (resp == code) {
             if (error == RADIO_ERROR_NONE) {
                 if (binder_call_settings_clip_query_ok(cbd, args)) {
                     return;
@@ -278,10 +311,12 @@ binder_call_settings_clip_query(
     void* data)
 {
     BinderCallSettings* self = binder_call_settings_get_data(s);
+    guint32 code = self->interface_aidl == RADIO_VOICE_INTERFACE ?
+        RADIO_VOICE_REQ_GET_CLIP : RADIO_REQ_GET_CLIP;
 
     DBG_(self, "");
     /* getClip(int32_t serial); */
-    binder_call_settings_call(self, RADIO_REQ_GET_CLIP,
+    binder_call_settings_call(self, code,
         binder_call_settings_clip_query_cb, BINDER_CB(cb), data);
 }
 
@@ -320,7 +355,9 @@ binder_call_settings_clir_cb(
     const BinderCallSettingsCbData* cbd = user_data;
 
     if (status == RADIO_TX_STATUS_OK) {
-        if (resp == RADIO_RESP_GET_CLIR) {
+        guint32 code = cbd->self->interface_aidl == RADIO_VOICE_INTERFACE ?
+            RADIO_VOICE_RESP_GET_CLIR : RADIO_RESP_GET_CLIR;
+        if (resp == code) {
             if (error == RADIO_ERROR_NONE) {
                 if (binder_call_settings_clir_ok(cbd, args)) {
                     return;
@@ -343,10 +380,12 @@ binder_call_settings_clir_query(
     void* data)
 {
     BinderCallSettings* self = binder_call_settings_get_data(s);
+    guint32 code = self->interface_aidl == RADIO_VOICE_INTERFACE ?
+        RADIO_VOICE_REQ_GET_CLIR : RADIO_REQ_GET_CLIR;
 
     DBG_(self, "");
     /* getClir(int32_t serial); */
-    binder_call_settings_call(self, RADIO_REQ_GET_CLIR,
+    binder_call_settings_call(self, code,
        binder_call_settings_clir_cb , BINDER_CB(cb), data);
 }
 
@@ -359,11 +398,13 @@ binder_call_settings_clir_set(
     void* data)
 {
     BinderCallSettings* self = binder_call_settings_get_data(s);
+    guint32 code = self->interface_aidl == RADIO_VOICE_INTERFACE ?
+        RADIO_VOICE_REQ_SET_CLIR : RADIO_REQ_SET_CLIR;
 
     /* setClir(int32_t serial, int32_t status); */
     GBinderWriter writer;
     RadioRequest* req = radio_request_new2(self->g,
-        RADIO_REQ_SET_CLIR, &writer,
+        code, &writer,
         binder_call_settings_set_cb,
         binder_call_settings_callback_data_free,
         binder_call_settings_callback_data_new(self, BINDER_CB(cb), data));
@@ -400,7 +441,8 @@ binder_call_settings_probe(
     BinderCallSettings* self = g_new0(BinderCallSettings, 1);
 
     self->s = s;
-    self->g = radio_request_group_new(modem->client);
+    self->g = radio_request_group_new(modem->voice_client);
+    self->interface_aidl = radio_client_aidl_interface(modem->voice_client);
     self->log_prefix = binder_dup_prefix(modem->log_prefix);
     self->register_id = g_idle_add(binder_call_settings_register, self);
 
