@@ -161,13 +161,6 @@ void
     BINDER_EXT_CALL_DISCONNECT_REASON reason,
     void* user_data);
 
-typedef
-void
-(*BinderExtCallRingbackToneFunc)(
-    BinderExtCall* ext,
-    gboolean start,
-    void* user_data);
-
 GType binder_ext_call_get_type(void);
 #define BINDER_EXT_TYPE_CALL (binder_ext_call_get_type())
 #define BINDER_EXT_CALL(obj) (G_TYPE_CHECK_INSTANCE_CAST(obj, \
@@ -294,12 +287,6 @@ void
 binder_ext_call_remove_handler(
     BinderExtCall* ext,
     gulong id);
-
-gulong
-binder_ext_call_add_ringback_tone_handler(
-    BinderExtCall* ext,
-    BinderExtCallRingbackToneFunc handler,
-    void* user_data); /* Since 1.1.22 */
 
 void
 binder_ext_call_remove_handlers(
