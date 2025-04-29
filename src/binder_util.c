@@ -40,7 +40,7 @@ static const char PROTO_IPV4V6_STR[] = "IPV4V6";
 #define RADIO_ACCESS_FAMILY_LTE \
     (RAF_LTE|RAF_LTE_CA|RAF_EHRPD)
 #define RADIO_ACCESS_FAMILY_NR \
-    (RAF_NR)
+    (RAF_NR|RAF_EHRPD)
 
 static
 const char*
