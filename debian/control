@@ -9,7 +9,7 @@ Build-Depends: debhelper-compat (= 13),
                libgbinder-radio-dev (>= 1.5.3),
                libglibutil-dev (>= 1.0.61),
                libmce-glib-dev (>= 1.0.6),
-               ofono-dev (>= 1.29),
+               ofono-dev (>= 2.1),
                libupower-glib-dev,
                batman-dev (>= 33),
                libbatman-wrappers (>= 33),
@@ -40,7 +40,8 @@ Package: libofonobinderpluginext
 Section: libs
 Architecture: any
 Multi-Arch: same
-Depends: ${shlibs:Depends}, ${misc:Depends}
+Depends: ${shlibs:Depends}, ${misc:Depends},
+         ofono (>= 2.1),
 Description: Extension interfaces for ofono-binder-plugin
 
 Package: libofonobinderpluginext-dev
