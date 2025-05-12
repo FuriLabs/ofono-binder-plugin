@@ -3,6 +3,7 @@ Section: libs
 Priority: optional
 Maintainer: Bardia Moshiri <bardia@furilabs.com>
 XSBC-Original-Maintainer: Slava Monich <slava.monich@jolla.com>
+XS-FuriOS-Extra-Repos: deb http://furilabs-ofono.repo.furios.io/trixie-mid-2-2/ trixie main
 Build-Depends: debhelper-compat (= 13),
                libglib2.0-dev (>= 2.0),
                libgbinder-dev (>= 1.1.29),
