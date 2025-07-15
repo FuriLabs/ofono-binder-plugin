@@ -407,6 +407,10 @@ binder_voicecall_merge_ext_calls(
      * with the new list.
      */
     for (l = self->calls; l; l = l->next) {
+        if (!l->data) {
+            continue;
+        }
+
         const BinderVoiceCallInfo* call = l->data;
 
         if (!!call->ext == keep_ext &&
