@@ -64,6 +64,7 @@ typedef struct binder_voicecall {
     struct ofono_voicecall* vc;
     char* log_prefix;
     GSList* calls;
+    GMutex calls_mutex;
     BinderExtCall* ext;
     BinderImsReg* ims_reg;
     RadioInstance* instance;
@@ -85,6 +86,7 @@ typedef struct binder_voicecall {
     gulong radio_event[VOICECALL_EVENT_COUNT];
     gulong supp_svc_notification_id;
     gulong ringback_tone_event_id;
+    gboolean processing_calls;
 } BinderVoiceCall;
 
 typedef struct binder_voicecall_cb_data {
@@ -399,6 +401,15 @@ binder_voicecall_merge_ext_calls(
     gboolean keep_ext)
 {
     GSList* l;
+    GSList* calls_copy = NULL;
+
+    /* Create a copy of the calls list while holding the mutex */
+    g_mutex_lock(&self->calls_mutex);
+    for (l = self->calls; l; l = l->next) {
+        calls_copy = g_slist_prepend(calls_copy, l->data);
+    }
+    calls_copy = g_slist_reverse(calls_copy);
+    g_mutex_unlock(&self->calls_mutex);
 
     /*
      * Since IRadio and ext may have different lists of calls,
@@ -406,7 +417,7 @@ binder_voicecall_merge_ext_calls(
      * before the current list of calls is going to be replaced
      * with the new list.
      */
-    for (l = self->calls; l; l = l->next) {
+    for (l = calls_copy; l; l = l->next) {
         const BinderVoiceCallInfo* call = l->data;
 
         if (!!call->ext == keep_ext &&
@@ -416,6 +427,9 @@ binder_voicecall_merge_ext_calls(
                 binder_voicecall_info_compare);
         }
     }
+
+    g_slist_free(calls_copy);
+
     return list;
 }
 
@@ -424,6 +438,10 @@ gboolean
 binder_voicecall_have_ext_call(
     BinderVoiceCall* self)
 {
+    GSList* l;
+
+    g_mutex_lock(&self->calls_mutex);
+
     if (self->ext) {
         GSList* l;
 
@@ -435,6 +453,9 @@ binder_voicecall_have_ext_call(
             }
         }
     }
+
+    g_mutex_unlock(&self->calls_mutex);
+
     return FALSE;
 }
 
@@ -445,6 +466,10 @@ binder_voicecall_find_call_with_status(
     enum ofono_call_status status)
 {
     GSList* l;
+
+    const BinderVoiceCallInfo* result = NULL;
+
+    g_mutex_lock(&self->calls_mutex);
 
     /*
      * Normally, the list is either empty or very short, there's
@@ -457,6 +482,9 @@ binder_voicecall_find_call_with_status(
             return call;
         }
     }
+
+    g_mutex_unlock(&self->calls_mutex);
+
     return NULL;
 }
 
@@ -466,7 +494,13 @@ binder_voicecall_find_call_link_with_id(
     BinderVoiceCall* self,
     guint call_id)
 {
-    return binder_voicecall_list_find_call_link_with_id(self->calls, call_id);
+    GSList* result;
+
+    g_mutex_lock(&self->calls_mutex);
+    result = binder_voicecall_list_find_call_link_with_id(self->calls, call_id);
+    g_mutex_unlock(&self->calls_mutex);
+
+    return result;
 }
 
 static
@@ -475,7 +509,11 @@ binder_voicecall_find_call_with_id(
     BinderVoiceCall* self,
     unsigned int call_id)
 {
-    GSList* l = binder_voicecall_find_call_link_with_id(self, call_id);
+    GSList* l;
+
+    g_mutex_lock(&self->calls_mutex);
+    l = binder_voicecall_list_find_call_link_with_id(self->calls, call_id);
+    g_mutex_unlock(&self->calls_mutex);
 
     return l ? l->data : NULL;
 }
@@ -499,13 +537,18 @@ binder_voicecall_remove_call_id(
     BinderVoiceCall* self,
     guint call_id)
 {
-    GSList* l = binder_voicecall_find_call_link_with_id(self, call_id);
+    GSList* l;
 
+    g_mutex_lock(&self->calls_mutex);
+
+    l = binder_voicecall_list_find_call_link_with_id(self->calls, call_id);
     if (l) {
         DBG_(self, "removed call %u", call_id);
         binder_voicecall_info_free(l->data);
         self->calls = g_slist_delete_link(self->calls, l);
     }
+
+    g_mutex_unlock(&self->calls_mutex);
 }
 
 static
@@ -647,9 +690,38 @@ binder_voicecall_set_calls(
     BinderVoiceCall* self,
     GSList* list)
 {
-    struct ofono_voicecall* vc = self->vc;
+    struct ofono_voicecall* vc;
     GSList* n = list;
-    GSList* o = self->calls;
+    GSList* o;
+
+    /* Validate self pointer */
+    if (!self) {
+        ofono_error("binder_voicecall_set_calls: self is NULL");
+        g_slist_free_full(list, binder_voicecall_info_free);
+        return;
+    }
+
+    /* Validate vc pointer */
+    if (!self->vc) {
+        ofono_error("binder_voicecall_set_calls: self->vc is NULL");
+        g_slist_free_full(list, binder_voicecall_info_free);
+        return;
+    }
+
+    vc = self->vc;
+
+    g_mutex_lock(&self->calls_mutex);
+
+    /* Prevent recursive calls */
+    if (self->processing_calls) {
+        g_mutex_unlock(&self->calls_mutex);
+        g_slist_free_full(list, binder_voicecall_info_free);
+        return;
+    }
+
+    self->processing_calls = TRUE;
+
+    o = self->calls;
 
     /* Note: the lists are sorted by id */
     while (n || o) {
@@ -661,8 +733,10 @@ binder_voicecall_set_calls(
 
             /* old call is gone */
             if (gutil_int_array_remove_all_fast(self->local_release_ids, id)) {
+                g_mutex_unlock(&self->calls_mutex);
                 ofono_voicecall_disconnected(vc, id,
                     OFONO_DISCONNECT_REASON_LOCAL_HANGUP, NULL);
+                g_mutex_lock(&self->calls_mutex);
             } else {
                 /* Get disconnect cause before informing oFono core */
                 BinderVoiceCallLastCauseData* reqdata =
@@ -687,7 +761,10 @@ binder_voicecall_set_calls(
         } else if (nc && (!oc || (nc->oc.id < oc->oc.id))) {
             /* new call, signal it */
             if (nc->oc.type == OFONO_CALL_MODE_VOICE) {
+                g_mutex_unlock(&self->calls_mutex);
                 ofono_voicecall_notify(vc, &nc->oc);
+                g_mutex_lock(&self->calls_mutex);
+
                 if (self->cb) {
                     ofono_voicecall_cb_t cb = self->cb;
                     void* cbdata = self->data;
@@ -695,7 +772,10 @@ binder_voicecall_set_calls(
 
                     self->cb = NULL;
                     self->data = NULL;
+
+                    g_mutex_unlock(&self->calls_mutex);
                     cb(binder_error_ok(&err), cbdata);
+                    g_mutex_lock(&self->calls_mutex);
                 }
             }
 
@@ -704,7 +784,9 @@ binder_voicecall_set_calls(
         } else {
             /* Both old and new call exist */
             if (!binder_voicecall_ofono_call_equal(&nc->oc, &oc->oc)) {
+                g_mutex_unlock(&self->calls_mutex);
                 ofono_voicecall_notify(vc, &nc->oc);
+                g_mutex_lock(&self->calls_mutex);
             }
             n = n->next;
             o = o->next;
@@ -713,6 +795,9 @@ binder_voicecall_set_calls(
 
     g_slist_free_full(self->calls, binder_voicecall_info_free);
     self->calls = list;
+
+    self->processing_calls = FALSE;
+    g_mutex_unlock(&self->calls_mutex);
 }
 
 static
@@ -1264,40 +1349,55 @@ binder_voicecall_hangup(
 {
     BinderVoiceCall* self = binder_voicecall_get_data(vc);
     BinderVoiceCallCbData* cbd = NULL;
+    GSList* calls_to_hangup = NULL;
     GSList* l;
+
+    /* Create a list of calls to hang up while holding the mutex */
+    g_mutex_lock(&self->calls_mutex);
+
+    for (l = self->calls; l; l = l->next) {
+        const BinderVoiceCallInfo* call = l->data;
+
+        if (!filter || filter(call)) {
+            /* Copy the call info for processing outside the mutex */
+            BinderVoiceCallInfo* call_copy = g_slice_dup(BinderVoiceCallInfo, call);
+            calls_to_hangup = g_slist_prepend(calls_to_hangup, call_copy);
+        }
+    }
+
+    g_mutex_unlock(&self->calls_mutex);
 
     /*
      * The idea is that we submit (potentially) multiple hangup
      * requests and invoke the callback after the last request
      * has completed (pending call count becomes zero).
      */
-    for (l = self->calls; l; l = l->next) {
+    for (l = calls_to_hangup; l; l = l->next) {
         const BinderVoiceCallInfo* call = l->data;
         const guint id = call->oc.id;
 
-        if (!filter || filter(call)) {
-            if (!cbd) {
-                cbd = binder_voicecall_cbd_new(self, cb, data);
-            }
-
-            /* Send request to the modem */
-            if (call->ext) {
-                DBG_(self, "hanging up ext call id %u", id);
-                if (binder_ext_call_hangup(call->ext, id,
-                    BINDER_EXT_CALL_HANGUP_NO_FLAGS,
-                    binder_voicecall_ext_disconnect_reason(call),
-                    binder_voicecall_cbd_ext_complete,
-                    binder_voicecall_cbd_destroy, cbd)) {
-                    binder_voicecall_request_submitted(cbd);
-                    continue;
-                }
-            }
-            DBG_(self, "hanging up call with id %u", id);
-            binder_voicecall_submit_hangup_req(vc, id, cbd);
-        } else {
-            DBG_(self, "Skipping call with id %u", id);
+        if (!cbd) {
+            cbd = binder_voicecall_cbd_new(self, cb, data);
         }
+
+        /* Send request to the modem */
+        if (call->ext) {
+            DBG_(self, "hanging up ext call id %u", id);
+            if (binder_ext_call_hangup(call->ext, id,
+                BINDER_EXT_CALL_HANGUP_NO_FLAGS,
+                binder_voicecall_ext_disconnect_reason(call),
+                binder_voicecall_cbd_ext_complete,
+                binder_voicecall_cbd_destroy, cbd)) {
+                binder_voicecall_request_submitted(cbd);
+                continue;
+            }
+        }
+        DBG_(self, "hanging up call with id %u", id);
+        binder_voicecall_submit_hangup_req(vc, id, cbd);
     }
+
+    /* Clean up the temporary list */
+    g_slist_free_full(calls_to_hangup, binder_voicecall_info_free);
 
     if (cbd) {
         /* Release our reference (if any) */
@@ -2228,6 +2328,8 @@ binder_voicecall_probe(
     self->idleq = gutil_idle_queue_new();
     self->ims_reg = binder_ims_reg_ref(modem->ims);
 
+    g_mutex_init(&self->calls_mutex);
+
     if (modem->ext && (self->ext =
         binder_ext_slot_get_interface(modem->ext,
         BINDER_EXT_TYPE_CALL)) != NULL) {
@@ -2249,12 +2351,28 @@ binder_voicecall_remove(
     BinderVoiceCall* self = binder_voicecall_get_data(vc);
 
     DBG_(self, "");
-    g_slist_free_full(self->calls, binder_voicecall_info_free);
+
+    if (self->ext) {
+        binder_ext_call_remove_all_handlers(self->ext, self->ext_event);
+        binder_ext_call_cancel(self->ext, self->ext_send_dtmf_id);
+        binder_ext_call_cancel(self->ext, self->ext_req_id);
+        binder_ext_call_unref(self->ext);
+        self->ext = NULL;
+    }
+
+    radio_client_remove_all_handlers(self->g->client, self->radio_event);
 
     radio_request_drop(self->send_dtmf_req);
     radio_request_drop(self->clcc_poll_req);
-    radio_client_remove_all_handlers(self->g->client, self->radio_event);
     radio_request_group_cancel(self->g);
+
+    g_mutex_lock(&self->calls_mutex);
+    g_slist_free_full(self->calls, binder_voicecall_info_free);
+    self->calls = NULL;
+    g_mutex_unlock(&self->calls_mutex);
+
+    g_mutex_clear(&self->calls_mutex);
+
     radio_request_group_unref(self->g);
     radio_client_unref(self->network_client);
     radio_instance_unref(self->instance);
@@ -2264,13 +2382,6 @@ binder_voicecall_remove(
     gutil_ints_unref(self->remote_hangup_reasons);
     gutil_int_array_free(self->local_release_ids, TRUE);
     gutil_idle_queue_free(self->idleq);
-
-    if (self->ext) {
-        binder_ext_call_remove_all_handlers(self->ext, self->ext_event);
-        binder_ext_call_cancel(self->ext, self->ext_send_dtmf_id);
-        binder_ext_call_cancel(self->ext, self->ext_req_id);
-        binder_ext_call_unref(self->ext);
-    }
 
     binder_ims_reg_unref(self->ims_reg);
     g_free(self->log_prefix);
