@@ -202,7 +202,7 @@ binder_call_settings_cw_query_cb(
     if (status == RADIO_TX_STATUS_OK) {
         guint32 code = cbd->self->interface_aidl == RADIO_VOICE_INTERFACE ?
             RADIO_VOICE_RESP_GET_CALL_WAITING : RADIO_RESP_GET_CALL_WAITING;
-        if (resp == code) {
+        if (resp == code || resp == 31) {
             if (error == RADIO_ERROR_NONE) {
                 if (binder_call_settings_cw_query_ok(cbd, args)) {
                     return;
