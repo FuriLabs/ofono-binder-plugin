@@ -46,7 +46,6 @@ typedef struct binder_radio_object {
     GHashTable* req_table;
     RadioRequest* pending_req;
     guint retry_id;
-    guint retry_count;
     guint state_changed_while_request_pending;
     RADIO_STATE last_known_state;
     gboolean power_cycle;
@@ -54,7 +53,6 @@ typedef struct binder_radio_object {
     gboolean next_state;
 } BinderRadioObject;
 
-#define MAX_POWER_RETRIES (5)
 #define POWER_RETRY_SECS (1)
 
 typedef BinderBaseClass BinderRadioObjectClass;
@@ -138,19 +136,14 @@ binder_radio_check_state(
         if (binder_radio_state_on(self->last_known_state) == should_be_on) {
             /* All is good, cancel pending retry if there is one */
             binder_radio_cancel_retry(self);
-            self->retry_count = 0;
         } else if (self->state_changed_while_request_pending) {
             /* Hmm... BINDER's reaction was inadequate, repeat */
             binder_radio_submit_power_request(self, should_be_on);
-        } else if (!self->retry_id && self->retry_count < MAX_POWER_RETRIES) {
+        } else if (!self->retry_id) {
             /* There has been no reaction so far, wait a bit */
-            DBG_(self, "retry scheduled (%u/%u)", self->retry_count + 1, MAX_POWER_RETRIES);
+            DBG_(self, "retry scheduled");
             self->retry_id = g_timeout_add_seconds(POWER_RETRY_SECS,
                 binder_radio_power_request_retry_cb, self);
-            self->retry_count++;
-        } else if (self->retry_count >= MAX_POWER_RETRIES) {
-            DBG_(self, "max retries (%u) reached, giving up", MAX_POWER_RETRIES);
-            self->retry_count = 0;
         }
     }
 
@@ -561,7 +554,6 @@ binder_radio_object_init(
     BinderRadioObject* self)
 {
     self->req_table = g_hash_table_new(g_direct_hash, g_direct_equal);
-    self->retry_count = 0;
 }
 
 static
