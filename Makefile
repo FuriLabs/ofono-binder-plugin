@@ -97,7 +97,7 @@ FULL_CFLAGS = $(BASE_FLAGS) $(CFLAGS) $(DEFINES) $(WARNINGS) -MMD -MP \
   -DGLIB_VERSION_MIN_REQUIRED=GLIB_VERSION_MAX_ALLOWED \
   $(shell pkg-config --cflags $(PKGS)) -I$(EXTLIB_DIR)/include
 FULL_LDFLAGS = $(BASE_FLAGS) $(LDFLAGS) -shared \
-  $(shell pkg-config --libs $(LDPKGS)) -lbatman-wrappers
+  $(shell pkg-config --libs $(LDPKGS))
 DEBUG_FLAGS = -g
 RELEASE_FLAGS =
 COVERAGE_FLAGS = -g

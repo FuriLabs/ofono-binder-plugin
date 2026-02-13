@@ -23,6 +23,8 @@
 #include <mce_charger.h>
 #include <mce_display.h>
 
+#include <upower.h>
+
 #include <radio_client.h>
 #include <radio_request.h>
 #include <radio_modem_types.h>
@@ -30,8 +32,6 @@
 #include <gbinder_writer.h>
 
 #include <gutil_macros.h>
-
-#include <batman/batman-wrappers.h>
 
 #define BATMAN_SCREEN_PATH "/var/lib/batman/screen"
 
@@ -113,6 +113,73 @@ static inline gboolean binder_devmon_ds_charging(MceCharger* charger)
 
 static inline gboolean binder_devmon_ds_display_on(MceDisplay* display)
     { return display->valid && display->state != MCE_DISPLAY_STATE_OFF; }
+
+typedef enum {
+    BATMAN_NO_BATTERY = 0,      /** No battery present in the system */
+    BATMAN_CHARGING = 1,        /** Battery is currently charging */
+    BATMAN_DISCHARGING = 2,     /** Battery is currently discharging */
+    BATMAN_FULLY_CHARGED = 3,   /** Battery is fully charged */
+    BATMAN_UNKNOWN = 4          /** Battery state cannot be determined */
+} batman_state_t;
+
+static batman_state_t
+get_battery_state(UpClient *upower)
+{
+    UpDevice *device = NULL;
+    batman_state_t state = BATMAN_NO_BATTERY;
+
+    device = up_device_new();
+
+    if (!up_device_set_object_path_sync(device,
+                                        "/org/freedesktop/UPower/devices/DisplayDevice",
+                                        NULL,
+                                        NULL)) {
+        g_debug("Failed to set device object path");
+        g_object_unref(device);
+        return BATMAN_NO_BATTERY;
+    }
+
+    if (device != NULL) {
+        UpDeviceState up_state;
+        gboolean power_supply;
+        UpDeviceKind kind;
+        gdouble percent; /* still required for g_object_get even if unused */
+
+        g_object_get(device,
+                     "power-supply", &power_supply,
+                     "kind", &kind,
+                     "state", &up_state,
+                     "percentage", &percent,
+                     NULL);
+
+        if (power_supply == TRUE && kind == UP_DEVICE_KIND_BATTERY) {
+            switch (up_state) {
+                case UP_DEVICE_STATE_CHARGING:
+                    state = BATMAN_CHARGING;
+                    break;
+
+                case UP_DEVICE_STATE_DISCHARGING:
+                    state = BATMAN_DISCHARGING;
+                    break;
+
+                case UP_DEVICE_STATE_FULLY_CHARGED:
+                    state = BATMAN_FULLY_CHARGED;
+                    break;
+
+                default:
+                    state = BATMAN_UNKNOWN;
+                    break;
+            }
+        }
+
+        g_object_unref(device);
+    }
+
+    if (state == BATMAN_NO_BATTERY)
+        g_debug("no battery");
+
+    return state;
+}
 
 static
 void
