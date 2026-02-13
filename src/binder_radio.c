@@ -29,6 +29,8 @@
 #include <gutil_macros.h>
 #include <gutil_misc.h>
 
+#include <gio/gio.h>
+
 /*
  * Object states:
  *
@@ -52,6 +54,8 @@ typedef struct binder_radio_object {
     gboolean power_cycle;
     gboolean next_state_valid;
     gboolean next_state;
+    gboolean sim_present_cached;
+    gboolean sim_present_valid;
 } BinderRadioObject;
 
 #define MAX_POWER_RETRIES (5)
@@ -125,6 +129,131 @@ binder_radio_cancel_retry(
     }
 }
 
+static void
+get_sim_props_cb(
+    GObject* source_object,
+    GAsyncResult* res,
+    gpointer user_data)
+{
+    BinderRadioObject* self = user_data;
+    GError* error = NULL;
+    GVariant* result;
+    GVariant* props;
+    GVariantIter iter;
+    const gchar* key;
+    GVariant* value;
+    gboolean present = TRUE;
+    GDBusConnection* bus = G_DBUS_CONNECTION(source_object);
+
+    result = g_dbus_connection_call_finish(bus, res, &error);
+    if (!result) {
+        DBG_(self, "GetProperties failed: %s", error->message);
+        g_clear_error(&error);
+        return;
+    }
+
+    props = g_variant_get_child_value(result, 0);
+    g_variant_iter_init(&iter, props);
+
+    while (g_variant_iter_next(&iter, "{&sv}", &key, &value)) {
+        if (!g_strcmp0(key, "Present")) {
+            present = g_variant_get_boolean(value);
+            break;
+        }
+    }
+
+    g_variant_unref(props);
+    g_variant_unref(result);
+
+    DBG_(self, "SIM present = %d", present);
+
+    self->sim_present_cached = present;
+    self->sim_present_valid = TRUE;
+}
+
+static void
+get_modems_cb(
+    GObject* source_object,
+    GAsyncResult* res,
+    gpointer user_data)
+{
+    BinderRadioObject* self = user_data;
+    GError* error = NULL;
+    GVariant* result;
+    GVariant* modems;
+    GVariantIter iter;
+    const gchar* modem_path = NULL;
+    GDBusConnection* bus = G_DBUS_CONNECTION(source_object);
+
+    result = g_dbus_connection_call_finish(bus, res, &error);
+    if (!result) {
+        DBG_(self, "GetModems failed: %s", error->message);
+        g_clear_error(&error);
+        return;
+    }
+
+    modems = g_variant_get_child_value(result, 0);
+    g_variant_iter_init(&iter, modems);
+
+    while (g_variant_iter_next(&iter, "(&oa{sv})", &modem_path, NULL)) {
+        if (g_str_has_prefix(modem_path, "/ril"))
+            break;
+        modem_path = NULL;
+    }
+
+    g_variant_unref(modems);
+    g_variant_unref(result);
+
+    if (!modem_path) {
+        DBG_(self, "No /ril modem found");
+        return;
+    }
+
+    g_dbus_connection_call(
+        bus,
+        "org.ofono",
+        modem_path,
+        "org.ofono.SimManager",
+        "GetProperties",
+        NULL,
+        G_VARIANT_TYPE("(a{sv})"),
+        G_DBUS_CALL_FLAGS_NONE,
+        -1,
+        NULL,
+        get_sim_props_cb,
+        self
+    );
+}
+
+static void
+ofono_check_sim_present_async(BinderRadioObject* self)
+{
+    GError* error = NULL;
+    GDBusConnection* bus;
+
+    bus = g_bus_get_sync(G_BUS_TYPE_SYSTEM, NULL, &error);
+    if (!bus) {
+        DBG_(self, "DBus connect failed: %s", error->message);
+        g_clear_error(&error);
+        return;
+    }
+
+    g_dbus_connection_call(
+        bus,
+        "org.ofono",
+        "/",
+        "org.ofono.Manager",
+        "GetModems",
+        NULL,
+        G_VARIANT_TYPE("(a(oa{sv}))"),
+        G_DBUS_CALL_FLAGS_NONE,
+        -1,
+        NULL,
+        get_modems_cb,
+        self
+    );
+}
+
 static
 void
 binder_radio_check_state(
@@ -142,15 +271,25 @@ binder_radio_check_state(
         } else if (self->state_changed_while_request_pending) {
             /* Hmm... BINDER's reaction was inadequate, repeat */
             binder_radio_submit_power_request(self, should_be_on);
-        } else if (!self->retry_id && self->retry_count < MAX_POWER_RETRIES) {
+        } else if (!self->retry_id) {
             /* There has been no reaction so far, wait a bit */
-            DBG_(self, "retry scheduled (%u/%u)", self->retry_count + 1, MAX_POWER_RETRIES);
+            if (self->retry_count >= MAX_POWER_RETRIES) {
+                ofono_check_sim_present_async(self);
+
+                if (self->sim_present_valid &&
+                    !self->sim_present_cached) {
+
+                    DBG_(self, "SIM absent, cancelling retries");
+                    binder_radio_cancel_retry(self);
+                    self->retry_count = 0;
+                    return;
+                }
+            }
+
+            DBG_(self, "retry scheduled");
             self->retry_id = g_timeout_add_seconds(POWER_RETRY_SECS,
                 binder_radio_power_request_retry_cb, self);
             self->retry_count++;
-        } else if (self->retry_count >= MAX_POWER_RETRIES) {
-            DBG_(self, "max retries (%u) reached, giving up", MAX_POWER_RETRIES);
-            self->retry_count = 0;
         }
     }
 
@@ -562,6 +701,8 @@ binder_radio_object_init(
 {
     self->req_table = g_hash_table_new(g_direct_hash, g_direct_equal);
     self->retry_count = 0;
+    self->sim_present_cached = TRUE;
+    self->sim_present_valid = FALSE;
 }
 
 static
