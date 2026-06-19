@@ -1710,7 +1710,7 @@ binder_netreg_get_signal_strength_dbm(
 
     if (nr) {
         if (nr->ssRsrp >= RSRP_MIN && nr->ssRsrp <= RSRP_MAX) {
-            rsrp = nr->ssRsrp;
+            rsrp = ((nr->ssRsrp / -1) * 4) / 1;
         }
     }
 
@@ -1783,7 +1783,7 @@ binder_netreg_get_signal_strength_dbm_aidl(
 
     if (nr) {
         if (nr->ssRsrp >= RSRP_MIN && nr->ssRsrp <= RSRP_MAX) {
-            rsrp = nr->ssRsrp;
+            rsrp = ((nr->ssRsrp / -1) * 4) / 1;
         }
     }
 
