@@ -1717,9 +1717,9 @@ binder_netreg_get_signal_strength_dbm(
     if (rssi >= RSCP_MIN) {
         return binder_netreg_dbm_from_rssi(rssi);
     } else if (rscp >= RSCP_MIN) {
-        return binder_netreg_dbm_from_rscp(rssi);
+        return binder_netreg_dbm_from_rscp(rscp);
     } else if (rsrp >= RSRP_MIN) {
-        return binder_netreg_dbm_from_rsrp(rssi);
+        return binder_netreg_dbm_from_rsrp(rsrp);
     } else {
         return -140;
     }
@@ -1790,9 +1790,9 @@ binder_netreg_get_signal_strength_dbm_aidl(
     if (rssi >= RSCP_MIN) {
         return binder_netreg_dbm_from_rssi(rssi);
     } else if (rscp >= RSCP_MIN) {
-        return binder_netreg_dbm_from_rscp(rssi);
+        return binder_netreg_dbm_from_rscp(rscp);
     } else if (rsrp >= RSRP_MIN) {
-        return binder_netreg_dbm_from_rsrp(rssi);
+        return binder_netreg_dbm_from_rsrp(rsrp);
     } else {
         return -140;
     }
