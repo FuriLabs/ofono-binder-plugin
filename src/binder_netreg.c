@@ -1674,89 +1674,16 @@ binder_netreg_get_signal_strength_dbm(
 {
     int rssi = -1, rscp = -1, rsrp = -1;
 
-    if (gsm->signalStrength <= RSSI_MAX) {
+    if (gsm && gsm->signalStrength <= RSSI_MAX) {
         rssi = gsm->signalStrength;
     }
 
-    if (lte->signalStrength <= RSSI_MAX &&
+    if (lte && lte->signalStrength <= RSSI_MAX &&
         (int)lte->signalStrength > rssi) {
         rssi = lte->signalStrength;
     }
 
-    if (lte->rsrp >= RSRP_MIN && lte->rsrp <= RSRP_MAX) {
-        rsrp = lte->rsrp;
-    }
-
-    if (wcdma) {
-        if (wcdma->base.signalStrength <= RSSI_MAX &&
-            (int)wcdma->base.signalStrength > rssi) {
-            rssi = wcdma->base.signalStrength;
-        }
-        if (wcdma->rscp <= RSCP_MAX) {
-            rscp = wcdma->rscp;
-        }
-    }
-
-    if (tdscdma) {
-        if (tdscdma->signalStrength <= RSSI_MAX &&
-            (int)tdscdma->signalStrength > rssi) {
-            rssi = tdscdma->signalStrength;
-        }
-        if (tdscdma->rscp <= RSCP_MAX &&
-            (int)tdscdma->rscp > rscp) {
-            rscp = tdscdma->rscp;
-        }
-    }
-
-    if (nr) {
-        if (nr->ssRsrp >= RSRP_MIN && nr->ssRsrp <= RSRP_MAX) {
-            rsrp = nr->ssRsrp;
-        }
-    }
-
-    if (rssi >= RSCP_MIN) {
-        return binder_netreg_dbm_from_rssi(rssi);
-    } else if (rscp >= RSCP_MIN) {
-        return binder_netreg_dbm_from_rscp(rscp);
-    } else if (rsrp >= RSRP_MIN) {
-        return binder_netreg_dbm_from_rsrp(rsrp);
-    } else {
-        return -140;
-    }
-}
-
-static
-int
-binder_netreg_get_signal_strength_dbm_aidl(
-    GBinderReader* reader)
-{
-    int rssi = -1, rscp = -1, rsrp = -1;
-    const RadioSignalStrengthGsm* gsm;
-    const RadioSignalStrengthLte* lte;
-    const RadioSignalStrengthTdScdma_1_2* tdscdma;
-    const RadioSignalStrengthWcdma_1_2* wcdma;
-    const RadioSignalStrengthNr* nr;
-
-    binder_read_parcelable_size(reader);
-
-    gsm = gbinder_reader_read_parcelable(reader, NULL);
-    gbinder_reader_read_parcelable(reader, NULL); /* cdma */
-    gbinder_reader_read_parcelable(reader, NULL); /* evdo */
-    lte = gbinder_reader_read_parcelable(reader, NULL);
-    tdscdma = gbinder_reader_read_parcelable(reader, NULL);
-    wcdma = gbinder_reader_read_parcelable(reader, NULL);
-    nr = gbinder_reader_read_parcelable(reader, NULL);
-
-    if (gsm->signalStrength <= RSSI_MAX) {
-        rssi = gsm->signalStrength;
-    }
-
-    if (lte->signalStrength <= RSSI_MAX &&
-        (int)lte->signalStrength > rssi) {
-        rssi = lte->signalStrength;
-    }
-
-    if (lte->rsrp >= RSRP_MIN && lte->rsrp <= RSRP_MAX) {
+    if (lte && lte->rsrp >= RSRP_MIN && lte->rsrp <= RSRP_MAX) {
         rsrp = lte->rsrp;
     }
 
@@ -1813,6 +1740,119 @@ binder_netreg_percent_from_dbm(
 }
 
 static
+int
+binder_netreg_percent_from_range(
+    int dbm,
+    int min_dbm,
+    int max_dbm,
+    int min_percent,
+    int max_percent)
+{
+    return min_percent + (((dbm - min_dbm) * (max_percent - min_percent)) /
+        (max_dbm - min_dbm));
+}
+
+static
+int
+binder_netreg_percent_from_nr_rsrp(
+    int rsrp)
+{
+    if (rsrp >= RSRP_MIN && rsrp <= RSRP_MAX) {
+        const int dbm = binder_netreg_dbm_from_rsrp(rsrp);
+
+        return (dbm <= -130) ? 1 :
+            (dbm < -118) ? binder_netreg_percent_from_range
+                (dbm, -130, -118, 1, 25) :
+            (dbm < -105) ? binder_netreg_percent_from_range
+                (dbm, -118, -105, 25, 50) :
+            (dbm < -95) ? binder_netreg_percent_from_range
+                (dbm, -105, -95, 50, 75) :
+            (dbm < -80) ? binder_netreg_percent_from_range
+                (dbm, -95, -80, 75, 100) : 100;
+    }
+    return 0;
+}
+
+static
+int
+binder_netreg_percent_from_lte_rsrp(
+    int rsrp)
+{
+    if (rsrp >= RSRP_MIN && rsrp <= RSRP_MAX) {
+        const int dbm = binder_netreg_dbm_from_rsrp(rsrp);
+
+        return (dbm <= -125) ? 1 :
+            (dbm < -115) ? binder_netreg_percent_from_range
+                (dbm, -125, -115, 1, 25) :
+            (dbm < -105) ? binder_netreg_percent_from_range
+                (dbm, -115, -105, 25, 50) :
+            (dbm < -95) ? binder_netreg_percent_from_range
+                (dbm, -105, -95, 50, 75) :
+            (dbm < -85) ? binder_netreg_percent_from_range
+                (dbm, -95, -85, 75, 100) : 100;
+    }
+    return 0;
+}
+
+static
+int
+binder_netreg_get_signal_strength_percent(
+    BinderNetReg* self,
+    const RadioSignalStrengthGsm* gsm,
+    const RadioSignalStrengthLte* lte,
+    const RadioSignalStrengthWcdma_1_2* wcdma,
+    const RadioSignalStrengthTdScdma_1_2* tdscdma,
+    const RadioSignalStrengthNr* nr)
+{
+    int percent = 0;
+    int dbm;
+
+    if (nr) {
+        percent = binder_netreg_percent_from_nr_rsrp(nr->ssRsrp);
+        if (percent) {
+            return percent;
+        }
+    }
+
+    if (lte) {
+        percent = binder_netreg_percent_from_lte_rsrp(lte->rsrp);
+        if (percent) {
+            return percent;
+        }
+    }
+
+    dbm = binder_netreg_get_signal_strength_dbm
+        (gsm, lte, wcdma, tdscdma, nr);
+    return dbm ? binder_netreg_percent_from_dbm(self, dbm) : 0;
+}
+
+static
+int
+binder_netreg_get_signal_strength_percent_aidl(
+    BinderNetReg* self,
+    GBinderReader* reader)
+{
+    const RadioSignalStrengthGsm* gsm;
+    const RadioSignalStrengthLte* lte;
+    const RadioSignalStrengthTdScdma_1_2* tdscdma;
+    const RadioSignalStrengthWcdma_1_2* wcdma;
+    const RadioSignalStrengthNr* nr;
+
+    binder_read_parcelable_size(reader);
+
+    gsm = gbinder_reader_read_parcelable(reader, NULL);
+    gbinder_reader_read_parcelable(reader, NULL); /* cdma */
+    gbinder_reader_read_parcelable(reader, NULL); /* evdo */
+    lte = gbinder_reader_read_parcelable(reader, NULL);
+    tdscdma = gbinder_reader_read_parcelable(reader, NULL);
+    wcdma = gbinder_reader_read_parcelable(reader, NULL);
+    nr = gbinder_reader_read_parcelable(reader, NULL);
+
+    return binder_netreg_get_signal_strength_percent
+        (self, gsm, lte, wcdma, tdscdma, nr);
+}
+
+static
 void
 binder_netreg_strength_notify(
     RadioClient* client,
@@ -1822,7 +1862,7 @@ binder_netreg_strength_notify(
 {
     BinderNetReg* self = user_data;
     GBinderReader reader;
-    int dbm = 0;
+    int percent = 0;
 
     gbinder_reader_copy(&reader, args);
     if (self->interface_aidl == RADIO_AIDL_INTERFACE_NONE) {
@@ -1831,34 +1871,32 @@ binder_netreg_strength_notify(
                 (&reader, RadioSignalStrength);
 
             if (ss) {
-                dbm = binder_netreg_get_signal_strength_dbm
-                    (&ss->gw, &ss->lte, NULL, NULL, NULL);
+                percent = binder_netreg_get_signal_strength_percent
+                    (self, &ss->gw, &ss->lte, NULL, NULL, NULL);
             }
         } else if (code == RADIO_IND_CURRENT_SIGNAL_STRENGTH_1_2) {
             const RadioSignalStrength_1_2* ss = gbinder_reader_read_hidl_struct
                 (&reader, RadioSignalStrength_1_2);
 
             if (ss) {
-                dbm = binder_netreg_get_signal_strength_dbm
-                    (&ss->gw, &ss->lte, &ss->wcdma, NULL, NULL);
+                percent = binder_netreg_get_signal_strength_percent
+                    (self, &ss->gw, &ss->lte, &ss->wcdma, NULL, NULL);
             }
         } else if (code == RADIO_IND_CURRENT_SIGNAL_STRENGTH_1_4) {
             const RadioSignalStrength_1_4* ss = gbinder_reader_read_hidl_struct
                 (&reader, RadioSignalStrength_1_4);
 
             if (ss) {
-                dbm = binder_netreg_get_signal_strength_dbm
-                    (&ss->gsm, &ss->lte, &ss->wcdma, &ss->tdscdma, &ss->nr);
+                percent = binder_netreg_get_signal_strength_percent
+                    (self, &ss->gsm, &ss->lte, &ss->wcdma, &ss->tdscdma, &ss->nr);
             }
         }
     } else {
-        dbm = binder_netreg_get_signal_strength_dbm_aidl(&reader);
+        percent = binder_netreg_get_signal_strength_percent_aidl(self, &reader);
     }
 
-    if (dbm) {
-        const int percent = binder_netreg_percent_from_dbm(self, dbm);
-
-        DBG_(self, "%d dBm (%d%%)", dbm, percent);
+    if (percent) {
+        DBG_(self, "%d%%", percent);
         ofono_netreg_strength_notify(self->netreg, percent);
     }
 }
@@ -1883,7 +1921,7 @@ static void binder_netreg_strength_cb(
     if (status == RADIO_TX_STATUS_OK) {
         if (error == RADIO_ERROR_NONE) {
             GBinderReader reader;
-            int dbm = 0;
+            int percent = 0;
 
             gbinder_reader_copy(&reader, args);
             if (self->interface_aidl == RADIO_AIDL_INTERFACE_NONE) {
@@ -1893,8 +1931,8 @@ static void binder_netreg_strength_cb(
                             RadioSignalStrength);
 
                     if (ss) {
-                        dbm = binder_netreg_get_signal_strength_dbm
-                            (&ss->gw, &ss->lte, NULL, NULL, NULL);
+                        percent = binder_netreg_get_signal_strength_percent
+                            (self, &ss->gw, &ss->lte, NULL, NULL, NULL);
                     }
                 } else if (resp == RADIO_RESP_GET_SIGNAL_STRENGTH_1_2) {
                     const RadioSignalStrength_1_2* ss =
@@ -1902,8 +1940,8 @@ static void binder_netreg_strength_cb(
                             RadioSignalStrength_1_2);
 
                     if (ss) {
-                        dbm = binder_netreg_get_signal_strength_dbm
-                            (&ss->gw, &ss->lte, &ss->wcdma, NULL, NULL);
+                        percent = binder_netreg_get_signal_strength_percent
+                            (self, &ss->gw, &ss->lte, &ss->wcdma, NULL, NULL);
                     }
                 } else if (resp == RADIO_RESP_GET_SIGNAL_STRENGTH_1_4) {
                     const RadioSignalStrength_1_4* ss =
@@ -1911,21 +1949,19 @@ static void binder_netreg_strength_cb(
                             RadioSignalStrength_1_4);
 
                     if (ss) {
-                        dbm = binder_netreg_get_signal_strength_dbm
-                            (&ss->gsm, &ss->lte, &ss->wcdma, &ss->tdscdma, &ss->nr);
+                        percent = binder_netreg_get_signal_strength_percent
+                            (self, &ss->gsm, &ss->lte, &ss->wcdma, &ss->tdscdma, &ss->nr);
                     }
                 } else {
                     ofono_error("Unexpected getSignalStrength response %d", resp);
                 }
             } else {
-                dbm = binder_netreg_get_signal_strength_dbm_aidl(&reader);
+                percent = binder_netreg_get_signal_strength_percent_aidl(self, &reader);
             }
 
-            if (dbm) {
-                const int percent = binder_netreg_percent_from_dbm(self, dbm);
-
+            if (percent) {
                 /* Success */
-                DBG_(self, "%d dBm (%d%%)", dbm, percent);
+                DBG_(self, "%d%%", percent);
                 cb(binder_error_ok(&err), percent, cbd->data);
                 return;
             }
