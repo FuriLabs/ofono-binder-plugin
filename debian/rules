@@ -4,13 +4,27 @@
 # Uncomment this to turn on verbose mode.
 #export DH_VERBOSE=1
 
-LIBDIR=usr/lib/$(shell dpkg-architecture -qDEB_HOST_MULTIARCH)
+ifneq (,$(filter parallel=%,$(DEB_BUILD_OPTIONS)))
+	NUMJOBS := $(patsubst parallel=%,%,$(filter parallel=%,$(DEB_BUILD_OPTIONS)))
+else
+	NUMJOBS := 1
+endif
+
+PLUGINDIR=/usr/lib/$(shell dpkg-architecture -qDEB_HOST_MULTIARCH)/ofono/plugins
+LIBDIR=/usr/lib/$(shell dpkg-architecture -qDEB_HOST_MULTIARCH)
+INCLUDEDIR=/usr/include/$(shell dpkg-architecture -qDEB_HOST_MULTIARCH)
 
 override_dh_auto_build:
-	dh_auto_build -- -C lib LIBDIR=$(LIBDIR) release pkgconfig ../debian/libofonobinderpluginext.install ../debian/libofonobinderpluginext-dev.install
+	make -j$(NUMJOBS) PLUGINDIR=$(PLUGINDIR) KEEP_SYMBOLS=1 release
+	make -j$(NUMJOBS) -C lib LIBDIR=$(LIBDIR) KEEP_SYMBOLS=1 release pkgconfig
 
 override_dh_auto_install:
-	dh_auto_install -- -C lib LIBDIR=$(LIBDIR) install-dev
+	make DESTDIR=$(CURDIR)/debian/tmp PLUGINDIR=$(PLUGINDIR) install
+	make DESTDIR=$(CURDIR)/debian/tmp -C lib LIBDIR=$(LIBDIR) TARGET_INCLUDE_DIR=$(INCLUDEDIR) install install-dev
+	find $(CURDIR)/debian
+
+override_dh_install:
+	dh_install --remaining-packages 
 
 %:
 	dh $@

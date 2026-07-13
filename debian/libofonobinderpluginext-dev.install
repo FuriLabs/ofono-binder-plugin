@@ -1,0 +1,3 @@
+/usr/lib/*/libofonobinderpluginext.so
+/usr/lib/*/pkgconfig/libofonobinderpluginext.pc
+/usr/include/*/ofonobinderpluginext
