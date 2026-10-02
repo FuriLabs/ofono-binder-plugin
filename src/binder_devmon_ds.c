@@ -372,14 +372,11 @@ binder_devmon_ds_io_charger_cb(
 }
 
 static
-gboolean
-binder_devmon_ds_io_batman_powersave(
-   gpointer user_data)
+int
+binder_devmon_ds_io_update_display(
+    DevMonIo* self)
 {
-    DevMonIo* self = (DevMonIo*)user_data;
-
     int display = 0;
-    int state = BATMAN_UNKNOWN;
 
     /* would be nice to have a dbus system service that reports status of session instead of this */
     FILE *screen_file = fopen(BATMAN_SCREEN_PATH, "r");
@@ -396,6 +393,22 @@ binder_devmon_ds_io_batman_powersave(
     } else {
         DBG_(self, "Failed to open screen state file: %s", strerror(errno));
     }
+
+    self->display->valid = TRUE;
+    self->display->state = display ? MCE_DISPLAY_STATE_ON : MCE_DISPLAY_STATE_OFF;
+
+    return display;
+}
+
+static
+gboolean
+binder_devmon_ds_io_batman_powersave(
+   gpointer user_data)
+{
+    DevMonIo* self = (DevMonIo*)user_data;
+
+    int display = binder_devmon_ds_io_update_display(self);
+    int state = BATMAN_UNKNOWN;
 
     state = get_battery_state(self->upower);
     DBG_(self, "Battery state: %s",
@@ -522,6 +535,7 @@ binder_devmon_ds_start_io(
             binder_devmon_ds_io_charger_cb, self);
 
     self->display = mce_display_ref(ds->display);
+    binder_devmon_ds_io_update_display(self);
     self->display_event_id[DISPLAY_EVENT_VALID] =
         mce_display_add_valid_changed_handler(self->display,
             binder_devmon_ds_io_display_cb, self);
