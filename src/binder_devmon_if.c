@@ -309,14 +309,11 @@ binder_devmon_if_io_display_cb(
 }
 
 static
-gboolean
-binder_devmon_if_io_batman_powersave(
-   gpointer user_data)
+int
+binder_devmon_if_io_update_display(
+    DevMonIo* self)
 {
-    DevMonIo* self = (DevMonIo*)user_data;
-
     int display = 0;
-    int state = BATMAN_UNKNOWN;
 
     /* would be nice to have a dbus system service that reports status of session instead of this */
     FILE *screen_file = fopen(BATMAN_SCREEN_PATH, "r");
@@ -332,6 +329,28 @@ binder_devmon_if_io_batman_powersave(
         fclose(screen_file);
     } else {
         DBG_(self, "Failed to open screen state file: %s", strerror(errno));
+    }
+
+    self->display->valid = TRUE;
+    self->display->state = display ? MCE_DISPLAY_STATE_ON : MCE_DISPLAY_STATE_OFF;
+
+    return display;
+}
+
+static
+gboolean
+binder_devmon_if_io_batman_powersave(
+   gpointer user_data)
+{
+    DevMonIo* self = (DevMonIo*)user_data;
+
+    int display = binder_devmon_if_io_update_display(self);
+    int state = BATMAN_UNKNOWN;
+    const gboolean display_on = binder_devmon_if_display_on(self->display);
+
+    if (self->display_on != display_on) {
+        self->display_on = display_on;
+        binder_devmon_if_io_set_indication_filter(self);
     }
 
     state = get_battery_state(self->upower);
@@ -412,6 +431,7 @@ binder_devmon_if_start_io(
             binder_devmon_if_io_charger_cb, self);
 
     self->display = mce_display_ref(impl->display);
+    binder_devmon_if_io_update_display(self);
     self->display_on = binder_devmon_if_display_on(self->display);
     self->display_event_id[DISPLAY_EVENT_VALID] =
         mce_display_add_valid_changed_handler(self->display,
